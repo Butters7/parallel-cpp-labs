@@ -1,1 +1,11 @@
 **/build/
+fraud_results.csv
+wireshark-wireshark-4.4.9/
+
+# Бинарные файлы
+2lab/k-NN/knn
+2lab/spam/spam
+2lab/spam/spam_model.dat
+2lab/sast/sast
+2lab/anti_fraud/anti_fraud
+2lab/sha1-bf/sha1_bf
