@@ -9,3 +9,5 @@ wireshark-wireshark-4.4.9/
 2lab/sast/sast
 2lab/anti_fraud/anti_fraud
 2lab/sha1-bf/sha1_bf
+3lab/nmap/nmap
+3lab/sqlmap/sqlmap_mpi_report.txt
