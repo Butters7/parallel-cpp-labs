@@ -1,51 +1,47 @@
 #ifndef SHA1_BRUTEFORCE_H
 #define SHA1_BRUTEFORCE_H
 
-#include <string>
-#include <functional>
-#include <vector>
-#include <ctime>
+#include <string.h>
+#include <omp.h>
+#include <stdio.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <vector>
+#include <string>
+#include <algorithm>
 
-class SHA1BruteForce {
-public:
-    SHA1BruteForce();
-    ~SHA1BruteForce();
+#define MAX_PASSWORD_LEN 256
+#define HASH_SIZE 20
 
-    void setTargetHash(const std::string& targetHash);
-    void setCharset(const std::string& charset);
-    void setLengthRange(int minLength, int maxLength);
-    void setProgressCallback(std::function<void(int, long long, double)> callback);
-    void setDictionaryFile(const std::string& dictionaryPath);
-    void setDictionaryRules(const std::vector<std::string>& rules);
-    
-    bool bruteForce(std::string& result);
-    bool dictionaryAttack(std::string& result);
-    bool hybridAttack(std::string& result);
-    bool bruteForceWithMask(std::string& result, const std::string& mask);
-    
-    long long getTotalAttempts();
-    double getElapsedTime();
-    double getSpeed();
+// SHA1 функция
+void sha1(const char* message, size_t length, uint8_t* digest);
 
-private:
-    std::string computeSHA1(const std::string& input);
-    std::string generateCombination(long long index, int length) const;
-    long long calculateTotalCombinations() const;
-    std::vector<std::string> applyRules(const std::string& word);
+// Сравнение хешей
+int hash_matches(uint8_t* hash1, uint8_t* hash2);
 
-    std::string targetHash;
-    std::string charset;
-    std::string dictionaryPath;
-    std::vector<std::string> dictionaryRules;
-    int minLength;
-    int maxLength;
-    long long totalAttempts;
-    double elapsedTime;
-    clock_t startTime;
-    std::function<void(int, long long, double)> progressCallback;
-    uint32_t leftRotate(uint32_t value, int shift);
-    std::string toHexString(uint32_t value);
-};
+// Вывод хеша
+void print_hash(uint8_t* hash);
+
+// Копирование строки
+char* strcpy_compact(char* dest, const char* src);
+
+// Конвертация hex в байты
+void hex_to_bytes(const char* hex, uint8_t* bytes);
+
+// Загрузка словаря
+std::vector<std::string> load_dictionary(const char* filename);
+
+// Атака по словарю на GPU
+// schedule(static) - статическое планирование (nvc++ GPU requirement)
+// #pragma omp atomic - атомарная операция (nvc++ GPU requirement)
+void dictionary_attack(uint8_t* target_hash, const char* dict_filename, size_t start = 0, size_t count = 0);
+
+// Прямой перебор на GPU
+// schedule(static) - статическое планирование (nvc++ GPU requirement)
+// #pragma omp atomic - атомарная операция (nvc++ GPU requirement)
+void brute_force_attack(uint8_t* target_hash, int min_length, int max_length);
+
+// Проверка GPU
+int check_gpu();
 
 #endif

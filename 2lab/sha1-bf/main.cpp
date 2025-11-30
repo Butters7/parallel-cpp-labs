@@ -1,41 +1,44 @@
 #include "sha1_bruteforce.h"
-#include <iostream>
-#include <iomanip>
 
-// Функция для отображения прогресса
-void progressCallback(int currentLength, long long attempts, double progress) {
-    std::cout << "\rТекущая длина: " << currentLength 
-              << " | Попыток: " << attempts 
-              << " | Прогресс: " << std::fixed << std::setprecision(2) << progress << "%";
-    std::cout.flush();
-}
-
-int main() {
-    SHA1BruteForce bruteForce;
-    
-    // Установка целевого хеша (хеш для "test")
-    bruteForce.setTargetHash("a94a8fe5ccb19ba61c4c0873d391e987982fbbd3");
-    
-    // Установка набора символов
-    bruteForce.setCharset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
-    
-    // Установка диапазона длин
-    bruteForce.setLengthRange(1, 6);
-    
-    // Установка callback для отображения прогресса
-    bruteForce.setProgressCallback(progressCallback);
-    
-    std::cout << "Начинаем перебор хеша SHA-1..." << std::endl;
-    
-    std::string result;
-    if (bruteForce.bruteForce(result)) {
-        std::cout << "\n\nНайдено соответствие: " << result << std::endl;
-        std::cout << "Всего попыток: " << bruteForce.getTotalAttempts() << std::endl;
-        std::cout << "Затраченное время: " << bruteForce.getElapsedTime() << " секунд" << std::endl;
-        std::cout << "Скорость: " << bruteForce.getSpeed() << " попыток/секунду" << std::endl;
+int main(int argc, char* argv[]) {
+    // Проверка GPU
+    if (check_gpu()) {
+        printf("### GPU доступен (OpenMP target) ###\n\n");
     } else {
-        std::cout << "\nСоответствие не найдено" << std::endl;
+        printf("### GPU недоступен ###\n\n");
     }
-    
+
+    // Целевые хеши из задания
+    const char* target_hashes[] = {
+        "4f43015fb43b7e308ec2b95e2b00134175cb4417",
+        "95b28b679cfd57b33ec0d5507984806c5a6f7a89"
+    };
+
+    printf("========================================\n");
+    printf("SHA1 Brute Force (OpenMP GPU)\n");
+    printf("========================================\n\n");
+
+    // Парсинг аргументов: ./sha1_bruteforce [словарь] [start] [count]
+    const char* dict_file = (argc > 1) ? argv[1] : "rockyou.txt";
+    size_t start = (argc > 2) ? atoll(argv[2]) : 0;
+    size_t count = (argc > 3) ? atoll(argv[3]) : 0;
+
+    for (int h = 0; h < 2; h++) {
+        printf("--- Хеш #%d: %s ---\n", h+1, target_hashes[h]);
+
+        uint8_t target[20];
+        hex_to_bytes(target_hashes[h], target);
+
+        // Атака по словарю
+        dictionary_attack(target, dict_file, start, count);
+
+        // Прямой перебор (только если count == 0, т.е. полный режим)
+        if (count == 0) {
+            printf("\nПрямой перебор:\n");
+            brute_force_attack(target, 1, 6);
+        }
+        printf("\n");
+    }
+
     return 0;
 }

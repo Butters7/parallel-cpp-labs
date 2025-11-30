@@ -1,88 +1,46 @@
 #include "sha1_bruteforce.h"
-#include <openssl/sha.h>
-#include <iostream>
-#include <iomanip>
-#include <sstream>
-#include <cmath>
-#include <fstream>
-#include <algorithm>
 
-SHA1BruteForce::SHA1BruteForce() 
-    : minLength(1), maxLength(6), totalAttempts(0), elapsedTime(0.0) {
-    // Стандартный набор символов
-    charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-}
-
-SHA1BruteForce::~SHA1BruteForce() {
-    // Деструктор
-}
-
-void SHA1BruteForce::setTargetHash(const std::string& targetHash) {
-    this->targetHash = targetHash;
-}
-
-void SHA1BruteForce::setCharset(const std::string& charset) {
-    this->charset = charset;
-}
-
-void SHA1BruteForce::setLengthRange(int minLength, int maxLength) {
-    this->minLength = minLength;
-    this->maxLength = maxLength;
-}
-
-void SHA1BruteForce::setProgressCallback(std::function<void(int, long long, double)> callback) {
-    this->progressCallback = callback;
-}
-
-void SHA1BruteForce::setDictionaryFile(const std::string& dictionaryPath) {
-    this->dictionaryPath = dictionaryPath;
-}
-
-void SHA1BruteForce::setDictionaryRules(const std::vector<std::string>& rules) {
-    this->dictionaryRules = rules;
-}
-
-std::string SHA1BruteForce::computeSHA1(const std::string& input) {
+// =============================================================================
+// SHA1 функция
+// =============================================================================
+void sha1(const char* message, size_t length, uint8_t* digest) {
     uint32_t h0 = 0x67452301;
     uint32_t h1 = 0xEFCDAB89;
     uint32_t h2 = 0x98BADCFE;
     uint32_t h3 = 0x10325476;
     uint32_t h4 = 0xC3D2E1F0;
 
+    size_t original_length = length;
+    size_t new_length = ((((length + 8) / 64) + 1) * 64);
+    uint8_t* msg = new uint8_t[new_length];
+    memcpy(msg, message, length);
+    msg[length] = 0x80;
 
-    std::string msg = input;
-    uint64_t original_bit_len = input.size() * 8;
-        
-    msg += static_cast<char>(0x80);
-    while ((msg.size() * 8) % 512 != 448) {
-        msg += static_cast<char>(0x00);
-    }
-    for (int i = 7; i >= 0; --i) {
-        msg += static_cast<char>((original_bit_len >> (i * 8)) & 0xFF);
+    for (size_t i = length + 1; i < new_length - 8; i++) {
+        msg[i] = 0;
     }
 
-    for (size_t i = 0; i < msg.size(); i += 64) {
-        const char* block = msg.data() + i;
-            
+    uint64_t bit_length = original_length * 8;
+    for (int i = 0; i < 8; i++) {
+        msg[new_length - 1 - i] = (bit_length >> (i * 8)) & 0xFF;
+    }
+
+    for (size_t i = 0; i < new_length; i += 64) {
         uint32_t w[80];
-        for (int j = 0; j < 16; ++j) {
-            w[j] = (static_cast<uint32_t>(block[j*4] & 0xFF) << 24) |
-                    (static_cast<uint32_t>(block[j*4+1] & 0xFF) << 16) |
-                    (static_cast<uint32_t>(block[j*4+2] & 0xFF) << 8) |
-                    (static_cast<uint32_t>(block[j*4+3] & 0xFF));
-        }
-            
-        for (int j = 16; j < 80; ++j) {
-            w[j] = leftRotate(w[j-3] ^ w[j-8] ^ w[j-14] ^ w[j-16], 1);
+
+        for (int j = 0; j < 16; j++) {
+            w[j] = (msg[i + j * 4] << 24) | (msg[i + j * 4 + 1] << 16) |
+                   (msg[i + j * 4 + 2] << 8) | (msg[i + j * 4 + 3]);
         }
 
-        uint32_t a = h0;
-        uint32_t b = h1;
-        uint32_t c = h2;
-        uint32_t d = h3;
-        uint32_t e = h4;
+        for (int j = 16; j < 80; j++) {
+            w[j] = w[j-3] ^ w[j-8] ^ w[j-14] ^ w[j-16];
+            w[j] = (w[j] << 1) | (w[j] >> 31);
+        }
 
-        for (int j = 0; j < 80; ++j) {
+        uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+
+        for (int j = 0; j < 80; j++) {
             uint32_t f, k;
 
             if (j < 20) {
@@ -99,306 +57,252 @@ std::string SHA1BruteForce::computeSHA1(const std::string& input) {
                 k = 0xCA62C1D6;
             }
 
-            uint32_t temp = leftRotate(a, 5) + f + e + k + w[j];
+            uint32_t temp = ((a << 5) | (a >> 27)) + f + e + k + w[j];
             e = d;
             d = c;
-            c = leftRotate(b, 30);
+            c = (b << 30) | (b >> 2);
             b = a;
             a = temp;
         }
 
-        h0 += a;
-        h1 += b;
-        h2 += c;
-        h3 += d;
-        h4 += e;
+        h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
     }
 
+    delete[] msg;
 
-    return toHexString(h0) + toHexString(h1) + toHexString(h2) + 
-               toHexString(h3) + toHexString(h4);
-}
-uint32_t SHA1BruteForce::leftRotate(uint32_t value, int shift)
-{
-     return (value << shift) | (value >> (32 - shift));
-}
-
-std::string SHA1BruteForce::toHexString(uint32_t value)
-{
-    std::stringstream ss;
-    ss << std::hex << std::setfill('0') << std::setw(8) << value;
-    return ss.str();
+    digest[0] = (h0 >> 24) & 0xFF; digest[1] = (h0 >> 16) & 0xFF;
+    digest[2] = (h0 >> 8) & 0xFF; digest[3] = h0 & 0xFF;
+    digest[4] = (h1 >> 24) & 0xFF; digest[5] = (h1 >> 16) & 0xFF;
+    digest[6] = (h1 >> 8) & 0xFF; digest[7] = h1 & 0xFF;
+    digest[8] = (h2 >> 24) & 0xFF; digest[9] = (h2 >> 16) & 0xFF;
+    digest[10] = (h2 >> 8) & 0xFF; digest[11] = h2 & 0xFF;
+    digest[12] = (h3 >> 24) & 0xFF; digest[13] = (h3 >> 16) & 0xFF;
+    digest[14] = (h3 >> 8) & 0xFF; digest[15] = h3 & 0xFF;
+    digest[16] = (h4 >> 24) & 0xFF; digest[17] = (h4 >> 16) & 0xFF;
+    digest[18] = (h4 >> 8) & 0xFF; digest[19] = h4 & 0xFF;
 }
 
-std::string SHA1BruteForce::generateCombination(long long index, int length) const {
-    std::string result;
-    long long temp = index;
-    
-    for (int i = 0; i < length; i++) {
-        int charIndex = temp % charset.size();
-        result.push_back(charset[charIndex]);
-        temp /= charset.size();
-    }
-    
-    return result;
+int hash_matches(uint8_t* hash1, uint8_t* hash2) {
+    return memcmp(hash1, hash2, 20) == 0;
 }
 
-long long SHA1BruteForce::calculateTotalCombinations() const {
-    long long total = 0;
-    for (int len = minLength; len <= maxLength; len++) {
-        total += static_cast<long long>(std::pow(charset.size(), len));
+void print_hash(uint8_t* hash) {
+    for (int i = 0; i < 20; i++) {
+        printf("%02x", hash[i]);
     }
-    return total;
+    printf("\n");
 }
 
-// Функция для применения правил трансформации к словам
-std::vector<std::string> SHA1BruteForce::applyRules(const std::string& word) {
-    std::vector<std::string> transformations;
-    transformations.push_back(word); // Оригинальное слово
-    
-    // Базовые трансформации
-    std::string upper = word;
-    std::transform(upper.begin(), upper.end(), upper.begin(), ::toupper);
-    transformations.push_back(upper);
-    
-    std::string lower = word;
-    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
-    transformations.push_back(lower);
-    
-    // Capitalize first letter
-    if (!word.empty()) {
-        std::string capitalized = word;
-        capitalized[0] = std::toupper(capitalized[0]);
-        transformations.push_back(capitalized);
-    }
-    
-    // Добавление чисел в конец (0-999)
-    for (int i = 0; i <= 999; i++) {
-        transformations.push_back(word + std::to_string(i));
-        if (i <= 99) {
-            transformations.push_back(word + (i < 10 ? "0" + std::to_string(i) : std::to_string(i)));
-        }
-    }
-    
-    // leet speak замены
-    std::string leet = word;
-    std::replace(leet.begin(), leet.end(), 'a', '@');
-    std::replace(leet.begin(), leet.end(), 'e', '3');
-    std::replace(leet.begin(), leet.end(), 'i', '1');
-    std::replace(leet.begin(), leet.end(), 'o', '0');
-    std::replace(leet.begin(), leet.end(), 's', '$');
-    transformations.push_back(leet);
-    
-    // Дублирование слова
-    transformations.push_back(word + word);
-    
-    // Реверс слова
-    std::string reversed = word;
-    std::reverse(reversed.begin(), reversed.end());
-    transformations.push_back(reversed);
-    
-    // Удаление дубликатов
-    std::sort(transformations.begin(), transformations.end());
-    transformations.erase(std::unique(transformations.begin(), transformations.end()), transformations.end());
-    
-    return transformations;
+char* strcpy_compact(char* dest, const char* src) {
+    char* ptr = dest;
+    while ((*dest++ = *src++) != '\0');
+    return ptr;
 }
 
-bool SHA1BruteForce::dictionaryAttack(std::string& result) {
-    if (dictionaryPath.empty()) {
-        std::cerr << "Dictionary path not set!" << std::endl;
-        return false;
+void hex_to_bytes(const char* hex, uint8_t* bytes) {
+    for (int i = 0; i < 20; i++) {
+        char byte_str[3] = {hex[i*2], hex[i*2+1], '\0'};
+        bytes[i] = (uint8_t)strtol(byte_str, NULL, 16);
     }
-    
-    std::ifstream file(dictionaryPath);
-    if (!file.is_open()) {
-        std::cerr << "Cannot open dictionary file: " << dictionaryPath << std::endl;
-        return false;
+}
+
+// =============================================================================
+// Загрузка словаря
+// =============================================================================
+std::vector<std::string> load_dictionary(const char* filename) {
+    std::vector<std::string> dictionary;
+    FILE* file = fopen(filename, "r");
+    if (!file) {
+        printf("Ошибка: не удалось открыть файл %s\n", filename);
+        return dictionary;
     }
-    
-    bool found = false;
-    totalAttempts = 0;
-    startTime = clock();
-    
-    std::vector<std::string> dictionaryWords;
-    std::string word;
-    
-    // Чтение словаря в память
-    while (std::getline(file, word)) {
-        if (!word.empty()) {
-            dictionaryWords.push_back(word);
-        }
+
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), file)) {
+        size_t len = strlen(buffer);
+        if (len > 0 && buffer[len-1] == '\n') buffer[--len] = '\0';
+        if (len > 0 && buffer[len-1] == '\r') buffer[--len] = '\0';
+        if (strlen(buffer) > 0) dictionary.push_back(buffer);
     }
-    file.close();
-    
-    std::cout << "Loaded " << dictionaryWords.size() << " words from dictionary" << std::endl;
-    
-    long long totalWords = dictionaryWords.size();
-    long long processedWords = 0;
-    
-    // Обработка словаря
-    for (size_t i = 0; i < dictionaryWords.size(); i++) {
+    fclose(file);
+    return dictionary;
+}
+
+// =============================================================================
+// Атака по словарю на GPU
+// schedule(static) - статическое планирование (требование nvc++ для GPU)
+// #pragma omp atomic - атомарная операция для безопасного обновления на GPU
+// start - начальный индекс в словаре
+// count - количество слов для обработки (0 = все)
+// =============================================================================
+void dictionary_attack(uint8_t* target_hash, const char* dict_filename, size_t start, size_t count) {
+    printf("Загружаем словарь: %s\n", dict_filename);
+    std::vector<std::string> dictionary = load_dictionary(dict_filename);
+
+    if (dictionary.empty()) {
+        printf("Словарь пуст\n");
+        return;
+    }
+
+    printf("Загружено %zu слов\n", dictionary.size());
+
+    // Обрезаем по start и count
+    if (start >= dictionary.size()) {
+        printf("Start индекс за пределами словаря\n");
+        return;
+    }
+    size_t end = (count == 0) ? dictionary.size() : std::min(start + count, dictionary.size());
+    size_t dict_size = end - start;
+
+    printf("Обработка слов %zu - %zu (%zu слов)\n", start, end - 1, dict_size);
+
+    int found = 0;
+    size_t found_index = 0;
+
+    char* dict_words = new char[dict_size * MAX_PASSWORD_LEN];
+    size_t* word_lengths = new size_t[dict_size];
+
+    for (size_t i = 0; i < dict_size; i++) {
+        strcpy_compact(dict_words + i * MAX_PASSWORD_LEN, dictionary[start + i].c_str());
+        word_lengths[i] = dictionary[start + i].length();
+    }
+
+    double start_time = omp_get_wtime();
+
+    // OpenMP GPU offload со статическим планированием
+    #pragma omp target teams distribute parallel for \
+                schedule(static) \
+                map(to: target_hash[0:20], dict_words[0:dict_size*MAX_PASSWORD_LEN], word_lengths[0:dict_size], dict_size) \
+                map(tofrom: found, found_index)
+    for (size_t i = 0; i < dict_size; i++) {
+        // Early termination - прерывание при нахождении
         if (found) continue;
-        
-        std::vector<std::string> candidates = applyRules(dictionaryWords[i]);
-        
-        for (const auto& candidate : candidates) {
-            if (found) break;
-            
-            std::string candidateHash = computeSHA1(candidate);
-            
-            if (candidateHash == targetHash) {
-                found = true;
-                result = candidate;
-                std::cout << "Found in dictionary attack: " << result << std::endl;
-                break;
+
+        const char* candidate = dict_words + i * MAX_PASSWORD_LEN;
+        size_t length = word_lengths[i];
+
+        uint8_t hash[20];
+        sha1(candidate, length, hash);
+
+        if (hash_matches(hash, target_hash)) {
+            // Атомарная операция для безопасного обновления на GPU
+            int old_found;
+            #pragma omp atomic capture
+            { old_found = found; found = 1; }
+            if (old_found == 0) {
+                found_index = i;
             }
-            
-            totalAttempts++;
-        }
-        
-        // Обновление прогресса
-        processedWords++;
-        
-        if (progressCallback && processedWords % 1000 == 0) {
-            double progress = static_cast<double>(processedWords) / totalWords * 100.0;
-            progressCallback(0, processedWords, progress);
         }
     }
-    
-    elapsedTime = (clock() - startTime) / (double)CLOCKS_PER_SEC;
-    return found;
-}
 
-bool SHA1BruteForce::hybridAttack(std::string& result) {
-    // Сначала пробуем атаку по словарю
-    std::cout << "Starting hybrid attack (dictionary + brute force)..." << std::endl;
-    
-    if (!dictionaryPath.empty()) {
-        std::cout << "Trying dictionary attack first..." << std::endl;
-        if (dictionaryAttack(result)) {
-            return true;
-        }
-        std::cout << "Dictionary attack failed, switching to brute force..." << std::endl;
+    double elapsed = omp_get_wtime() - start_time;
+
+    printf("Время: %.3f сек (%.0f hash/sec)\n", elapsed, dict_size / elapsed);
+
+    if (found) {
+        const char* found_password = dict_words + found_index * MAX_PASSWORD_LEN;
+        printf("*** Пароль найден: %s ***\n", found_password);
+        printf("Проверка SHA1: ");
+        uint8_t check[20];
+        sha1(found_password, strlen(found_password), check);
+        print_hash(check);
+    } else {
+        printf("Пароль не найден в словаре\n");
     }
-    
-    // Если словарная атака не сработала, переходим к brute force
-    return bruteForce(result);
+
+    delete[] dict_words;
+    delete[] word_lengths;
 }
 
-bool SHA1BruteForce::bruteForce(std::string& result) {
-    bool found = false;
-    totalAttempts = 0;
-    startTime = clock();
-    
-    long long totalCombinations = calculateTotalCombinations();
-    long long processedCombinations = 0;
-    
-    // Перебор по длине пароля
-    for (int length = minLength; length <= maxLength && !found; length++) {
-        long long combinationsForLength = static_cast<long long>(std::pow(charset.size(), length));
-        
-        for (long long i = 0; i < combinationsForLength; i++) {
+// =============================================================================
+// Прямой перебор на GPU
+// schedule(static) - статическое планирование (требование nvc++ для GPU)
+// #pragma omp atomic - атомарная операция для безопасного обновления на GPU
+// Поддержка min/max длины пароля
+// =============================================================================
+void brute_force_attack(uint8_t* target_hash, int min_length, int max_length) {
+    const char charset[] = "abcdefghijklmnopqrstuvwxyz";
+    int charset_len = sizeof(charset) - 1;
+    int found = 0;
+    long long found_index = -1;
+    int found_len = 0;
+
+    printf("Перебор (длина %d-%d)...\n", min_length, max_length);
+
+    double total_start = omp_get_wtime();
+    long long total_attempts = 0;
+
+    for (int len = min_length; len <= max_length && !found; len++) {
+        long long max_i = 1;
+        for (int j = 0; j < len; j++) max_i *= charset_len;
+
+        printf("Длина %d: %lld комбинаций\n", len, max_i);
+
+        double start = omp_get_wtime();
+
+        // OpenMP GPU offload со статическим планированием
+        #pragma omp target teams distribute parallel for \
+                    schedule(static) \
+                    map(to: target_hash[0:20], charset[0:charset_len+1], len, max_i, charset_len) \
+                    map(tofrom: found, found_index)
+        for (long long i = 0; i < max_i; i++) {
+            // Early termination
             if (found) continue;
-            
-            std::string candidate = generateCombination(i, length);
-            std::string candidateHash = computeSHA1(candidate);
-            
-            if (candidateHash == targetHash) {
-                found = true;
-                result = candidate;
-            }
-            
-            totalAttempts++;
-            processedCombinations++;
-            
-            if (progressCallback && processedCombinations % 10000 == 0) {
-                double progress = static_cast<double>(processedCombinations) / totalCombinations * 100.0;
-                progressCallback(length, processedCombinations, progress);
-            }
-        }
-        
-        if (progressCallback) {
-            double progress = static_cast<double>(processedCombinations) / totalCombinations * 100.0;
-            progressCallback(length, processedCombinations, progress);
-        }
-    }
-    
-    elapsedTime = (clock() - startTime) / (double)CLOCKS_PER_SEC;
-    return found;
-}
 
-bool SHA1BruteForce::bruteForceWithMask(std::string& result, const std::string& mask) {
-    // Простая реализация атаки по маске
-    // Маска: "pass???" где ? - любой символ из charset
-    bool found = false;
-    totalAttempts = 0;
-    startTime = clock();
-    
-    // Подсчет количества переменных символов в маске
-    int variableCount = 0;
-    for (char c : mask) {
-        if (c == '?') variableCount++;
-    }
-    
-    if (variableCount == 0) {
-        // Проверяем саму маску
-        std::string candidateHash = computeSHA1(mask);
-        if (candidateHash == targetHash) {
-            result = mask;
-            found = true;
-        }
-        totalAttempts = 1;
-        elapsedTime = (clock() - startTime) / (double)CLOCKS_PER_SEC;
-        return found;
-    }
-    
-    long long combinationsForMask = static_cast<long long>(std::pow(charset.size(), variableCount));
-    
-    for (long long i = 0; i < combinationsForMask; i++) {
-        if (found) continue;
-        
-        std::string candidate = mask;
-        long long temp = i;
-        int pos = 0;
-        
-        // Заменяем '?' в маске символами из charset
-        for (char& c : candidate) {
-            if (c == '?') {
-                int charIndex = temp % charset.size();
-                c = charset[charIndex];
-                temp /= charset.size();
-                pos++;
+            char candidate[32];
+            long long temp = i;
+            for (int pos = 0; pos < len; pos++) {
+                candidate[pos] = charset[temp % charset_len];
+                temp /= charset_len;
+            }
+            candidate[len] = '\0';
+
+            uint8_t hash[20];
+            sha1(candidate, len, hash);
+
+            if (hash_matches(hash, target_hash)) {
+                // Атомарная операция для безопасного обновления на GPU
+                int old_found;
+                #pragma omp atomic capture
+                { old_found = found; found = 1; }
+                if (old_found == 0) {
+                    found_index = i;
+                }
             }
         }
-        
-        std::string candidateHash = computeSHA1(candidate);
-        
-        if (candidateHash == targetHash) {
-            found = true;
-            result = candidate;
-        }
-        
-        totalAttempts++;
-        
-        if (progressCallback && totalAttempts % 10000 == 0) {
-            double progress = static_cast<double>(totalAttempts) / combinationsForMask * 100.0;
-            progressCallback(variableCount, totalAttempts, progress);
-        }
+
+        double elapsed = omp_get_wtime() - start;
+        total_attempts += max_i;
+        printf("  %.3f сек (%.0f hash/sec)\n", elapsed, max_i / elapsed);
+
+        if (found) found_len = len;
     }
-    
-    elapsedTime = (clock() - startTime) / (double)CLOCKS_PER_SEC;
-    return found;
+
+    double total_elapsed = omp_get_wtime() - total_start;
+    printf("Всего: %lld попыток за %.3f сек\n", total_attempts, total_elapsed);
+
+    if (found && found_index >= 0) {
+        char found_password[32];
+        long long temp = found_index;
+        for (int pos = 0; pos < found_len; pos++) {
+            found_password[pos] = charset[temp % charset_len];
+            temp /= charset_len;
+        }
+        found_password[found_len] = '\0';
+        printf("*** Пароль найден: %s ***\n", found_password);
+    } else {
+        printf("Пароль не найден\n");
+    }
 }
 
-long long SHA1BruteForce::getTotalAttempts() {
-    return totalAttempts;
-}
-
-double SHA1BruteForce::getElapsedTime() {
-    return elapsedTime;
-}
-
-double SHA1BruteForce::getSpeed() {
-    return elapsedTime > 0 ? totalAttempts / elapsedTime : 0;
+// =============================================================================
+// Проверка GPU
+// =============================================================================
+int check_gpu() {
+    int on_gpu = 0;
+    #pragma omp target map(from:on_gpu)
+    {
+        if (omp_is_initial_device() == 0) on_gpu = 1;
+    }
+    return on_gpu;
 }
