@@ -272,24 +272,44 @@ public:
     }
 
     // Сбор всех исходных файлов из директории
+    // Вызывается ОДИН РАЗ до параллельного анализа - потокобезопасность не требуется
     std::vector<std::string> collectSourceFiles(const std::string& directory) {
         std::vector<std::string> files;
 
-        for (const auto& entry : fs::recursive_directory_iterator(directory)) {
-            if (entry.is_regular_file() && isSourceFile(entry.path().string())) {
-                files.push_back(entry.path().string());
+        try {
+            // Обход директорий может выбросить исключение если нет прав доступа
+            for (const auto& entry : fs::recursive_directory_iterator(
+                directory,
+                fs::directory_options::skip_permission_denied)) {
+
+                try {
+                    if (entry.is_regular_file() && isSourceFile(entry.path().string())) {
+                        files.push_back(entry.path().string());
+                    }
+                } catch (const fs::filesystem_error& e) {
+                    // Пропускаем файлы с ошибками доступа
+                    std::cerr << "Предупреждение: " << e.what() << std::endl;
+                }
             }
+        } catch (const fs::filesystem_error& e) {
+            std::cerr << "Ошибка при обходе директории: " << e.what() << std::endl;
         }
 
         return files;
     }
 
     // Чтение файла в вектор строк
+    // ПОТОКОБЕЗОПАСНО: каждый вызов создает свой локальный ifstream
     std::vector<std::string> readFile(const std::string& filename) {
         std::vector<std::string> lines;
         std::ifstream file(filename);
-        std::string line;
 
+        if (!file.is_open()) {
+            std::cerr << "Предупреждение: не удалось открыть файл " << filename << std::endl;
+            return lines;
+        }
+
+        std::string line;
         while (std::getline(file, line)) {
             lines.push_back(line);
         }
@@ -301,25 +321,36 @@ public:
     void analyzeDirectory(const std::string& directory) {
         std::cout << "Сканирование директории: " << directory << std::endl;
 
-        // Собираем все файлы для анализа
+        // Собираем все файлы для анализа (последовательно, один раз)
         std::vector<std::string> files = collectSourceFiles(directory);
         std::cout << "Найдено файлов для анализа: " << files.size() << std::endl;
 
+        if (files.empty()) {
+            std::cout << "Нет файлов для анализа" << std::endl;
+            return;
+        }
+
         // Вектор для сбора результатов из всех потоков
+        // Предварительно выделяем память для максимального числа потоков
         std::vector<std::vector<SecurityIssue>> threadResults(omp_get_max_threads());
 
         // #pragma omp parallel for - распараллеливает обработку файлов
         // schedule(dynamic) - динамическое распределение файлов между потоками
-        // файлы разного размера - динамическое распределение эффективнее)
-        // Каждый поток пишет в свой вектор threadResults[omp_get_thread_num()]
+        // (файлы разного размера - динамическое распределение эффективнее)
+        // ПОТОКОБЕЗОПАСНОСТЬ: каждый поток пишет в свой вектор threadResults[threadId]
         // чтобы избежать синхронизации при записи результатов
+        // Каждый файл обрабатывается ровно одним потоком (нет коллизий)
         #pragma omp parallel for schedule(dynamic)
         for (size_t i = 0; i < files.size(); ++i) {
             int threadId = omp_get_thread_num();
             const std::string& file = files[i];
 
-            // Читаем файл
+            // Читаем файл (каждый поток создает свой локальный ifstream - потокобезопасно)
             std::vector<std::string> lines = readFile(file);
+
+            if (lines.empty()) {
+                continue;  // Пропускаем пустые или недоступные файлы
+            }
 
             // Анализируем каждую строку на наличие опасных паттернов
             for (size_t lineNum = 0; lineNum < lines.size(); ++lineNum) {

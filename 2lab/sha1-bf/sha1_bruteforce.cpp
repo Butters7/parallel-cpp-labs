@@ -12,7 +12,20 @@ void sha1(const char* message, size_t length, uint8_t* digest) {
 
     size_t original_length = length;
     size_t new_length = ((((length + 8) / 64) + 1) * 64);
-    uint8_t* msg = new uint8_t[new_length];
+
+    // Используем массив фиксированного размера вместо new/delete
+    // Это безопаснее при исключениях и работает на GPU
+    // Максимальный размер для MAX_PASSWORD_LEN=256: ((256+8)/64+1)*64 = 320
+    constexpr size_t MAX_MSG_SIZE = 512;
+    uint8_t msg[MAX_MSG_SIZE];
+
+    // Проверка размера для безопасности
+    if (new_length > MAX_MSG_SIZE) {
+        // Слишком длинное сообщение - заполняем digest нулями
+        memset(digest, 0, HASH_SIZE);
+        return;
+    }
+
     memcpy(msg, message, length);
     msg[length] = 0x80;
 
@@ -68,7 +81,7 @@ void sha1(const char* message, size_t length, uint8_t* digest) {
         h0 += a; h1 += b; h2 += c; h3 += d; h4 += e;
     }
 
-    delete[] msg;
+    // Delete[] msg больше не нужен - используем массив на стеке
 
     digest[0] = (h0 >> 24) & 0xFF; digest[1] = (h0 >> 16) & 0xFF;
     digest[2] = (h0 >> 8) & 0xFF; digest[3] = h0 & 0xFF;
@@ -93,22 +106,59 @@ void print_hash(uint8_t* hash) {
     printf("\n");
 }
 
-char* strcpy_compact(char* dest, const char* src) {
+bool strcpy_compact(char* dest, const char* src, size_t dest_size) {
+    // Добавлена проверка размера буфера для защиты от buffer overflow
+    if (!dest || !src || dest_size == 0) {
+        return false;
+    }
+
+    // Проверяем что src поместится в dest (включая null terminator)
+    size_t src_len = strlen(src);
+    if (src_len >= dest_size) {
+        return false;  // Недостаточно места
+    }
+
+    // Безопасное копирование
     char* ptr = dest;
     while ((*dest++ = *src++) != '\0');
-    return ptr;
+
+    return true;
 }
 
-void hex_to_bytes(const char* hex, uint8_t* bytes) {
+bool hex_to_bytes(const char* hex, uint8_t* bytes) {
+    // Добавлена обработка ошибок
+    if (!hex || !bytes) {
+        return false;  // Проверка на NULL
+    }
+
+    // Проверяем длину строки (должна быть минимум 40 символов для 20 байт)
+    size_t hex_len = strlen(hex);
+    if (hex_len < 40) {
+        return false;
+    }
+
     for (int i = 0; i < 20; i++) {
         char byte_str[3] = {hex[i*2], hex[i*2+1], '\0'};
-        bytes[i] = (uint8_t)strtol(byte_str, NULL, 16);
+
+        // Проверяем что символы валидные hex
+        if (!isxdigit(hex[i*2]) || !isxdigit(hex[i*2+1])) {
+            return false;
+        }
+
+        char* endptr;
+        long value = strtol(byte_str, &endptr, 16);
+
+        // Проверяем успешность конвертации
+        if (endptr != byte_str + 2) {
+            return false;
+        }
+
+        bytes[i] = (uint8_t)value;
     }
+
+    return true;
 }
 
-// =============================================================================
-// Загрузка словаря
-// =============================================================================
 std::vector<std::string> load_dictionary(const char* filename) {
     std::vector<std::string> dictionary;
     FILE* file = fopen(filename, "r");
@@ -130,10 +180,7 @@ std::vector<std::string> load_dictionary(const char* filename) {
 
 // =============================================================================
 // Атака по словарю на GPU
-// schedule(static) - статическое планирование (требование nvc++ для GPU)
-// #pragma omp atomic - атомарная операция для безопасного обновления на GPU
-// start - начальный индекс в словаре
-// count - количество слов для обработки (0 = все)
+// start - начальный индекс, count - количество (0 = все)
 // =============================================================================
 void dictionary_attack(uint8_t* target_hash, const char* dict_filename, size_t start, size_t count) {
     printf("Загружаем словарь: %s\n", dict_filename);
@@ -146,7 +193,6 @@ void dictionary_attack(uint8_t* target_hash, const char* dict_filename, size_t s
 
     printf("Загружено %zu слов\n", dictionary.size());
 
-    // Обрезаем по start и count
     if (start >= dictionary.size()) {
         printf("Start индекс за пределами словаря\n");
         return;
@@ -163,19 +209,25 @@ void dictionary_attack(uint8_t* target_hash, const char* dict_filename, size_t s
     size_t* word_lengths = new size_t[dict_size];
 
     for (size_t i = 0; i < dict_size; i++) {
-        strcpy_compact(dict_words + i * MAX_PASSWORD_LEN, dictionary[start + i].c_str());
-        word_lengths[i] = dictionary[start + i].length();
+        // Проверяем результат strcpy_compact для защиты от переполнения
+        if (!strcpy_compact(dict_words + i * MAX_PASSWORD_LEN,
+                           dictionary[start + i].c_str(),
+                           MAX_PASSWORD_LEN)) {
+            printf("Предупреждение: слово %zu слишком длинное, пропускаем\n", start + i);
+            dict_words[i * MAX_PASSWORD_LEN] = '\0';  // Пустая строка
+            word_lengths[i] = 0;
+        } else {
+            word_lengths[i] = dictionary[start + i].length();
+        }
     }
 
     double start_time = omp_get_wtime();
 
-    // OpenMP GPU offload со статическим планированием
     #pragma omp target teams distribute parallel for \
                 schedule(static) \
                 map(to: target_hash[0:20], dict_words[0:dict_size*MAX_PASSWORD_LEN], word_lengths[0:dict_size], dict_size) \
                 map(tofrom: found, found_index)
     for (size_t i = 0; i < dict_size; i++) {
-        // Early termination - прерывание при нахождении
         if (found) continue;
 
         const char* candidate = dict_words + i * MAX_PASSWORD_LEN;
@@ -185,12 +237,15 @@ void dictionary_attack(uint8_t* target_hash, const char* dict_filename, size_t s
         sha1(candidate, length, hash);
 
         if (hash_matches(hash, target_hash)) {
-            // Атомарная операция для безопасного обновления на GPU
-            int old_found;
-            #pragma omp atomic capture
-            { old_found = found; found = 1; }
-            if (old_found == 0) {
-                found_index = i;
+            // Используем critical section для атомарности всей операции
+            // Иначе несколько потоков могут одновременно пройти проверку и записать
+            // разные значения в found_index (race condition)
+            #pragma omp critical
+            {
+                if (!found) {
+                    found = 1;
+                    found_index = i;
+                }
             }
         }
     }
@@ -216,9 +271,6 @@ void dictionary_attack(uint8_t* target_hash, const char* dict_filename, size_t s
 
 // =============================================================================
 // Прямой перебор на GPU
-// schedule(static) - статическое планирование (требование nvc++ для GPU)
-// #pragma omp atomic - атомарная операция для безопасного обновления на GPU
-// Поддержка min/max длины пароля
 // =============================================================================
 void brute_force_attack(uint8_t* target_hash, int min_length, int max_length) {
     const char charset[] = "abcdefghijklmnopqrstuvwxyz";
@@ -240,13 +292,11 @@ void brute_force_attack(uint8_t* target_hash, int min_length, int max_length) {
 
         double start = omp_get_wtime();
 
-        // OpenMP GPU offload со статическим планированием
         #pragma omp target teams distribute parallel for \
                     schedule(static) \
                     map(to: target_hash[0:20], charset[0:charset_len+1], len, max_i, charset_len) \
                     map(tofrom: found, found_index)
         for (long long i = 0; i < max_i; i++) {
-            // Early termination
             if (found) continue;
 
             char candidate[32];
@@ -261,12 +311,15 @@ void brute_force_attack(uint8_t* target_hash, int min_length, int max_length) {
             sha1(candidate, len, hash);
 
             if (hash_matches(hash, target_hash)) {
-                // Атомарная операция для безопасного обновления на GPU
-                int old_found;
-                #pragma omp atomic capture
-                { old_found = found; found = 1; }
-                if (old_found == 0) {
-                    found_index = i;
+                // Используем critical section для атомарности всей операции
+                // Иначе несколько потоков могут одновременно пройти проверку и записать
+                // разные значения в found_index (race condition)
+                #pragma omp critical
+                {
+                    if (!found) {
+                        found = 1;
+                        found_index = i;
+                    }
                 }
             }
         }
@@ -295,9 +348,6 @@ void brute_force_attack(uint8_t* target_hash, int min_length, int max_length) {
     }
 }
 
-// =============================================================================
-// Проверка GPU
-// =============================================================================
 int check_gpu() {
     int on_gpu = 0;
     #pragma omp target map(from:on_gpu)
