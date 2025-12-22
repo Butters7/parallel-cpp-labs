@@ -26,11 +26,26 @@ __device__ int binarySearchStringIndex(const int* offsets, int num_strings, int 
 
 __global__ void obfuscateKernel(char* data, const int* offsets, const int* keys,
                                  int num_strings, int total_chars) {
+    // Shared memory для кэширования части offsets и keys
+    extern __shared__ int shared_mem[];
+    int* shared_offsets = shared_mem;
+    int* shared_keys = &shared_mem[BLOCK_SIZE];
+
     int char_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+
+    // Кэшируем данные в shared memory (каждый поток загружает один элемент)
+    // Используем оптимизированный доступ для предотвращения bank conflicts
+    if (tid < num_strings && tid < BLOCK_SIZE) {
+        shared_offsets[tid] = offsets[tid];
+        shared_keys[tid] = keys[tid];
+    }
+    __syncthreads();
 
     if (char_idx >= total_chars) return;
 
     // Бинарный поиск: определяем какой строке принадлежит символ
+    // Используем глобальную память, т.к. бинарный поиск требует доступ ко всем offset
     int string_idx = binarySearchStringIndex(offsets, num_strings, char_idx);
 
     // Позиция символа внутри строки
@@ -141,13 +156,21 @@ int main() {
     float copy_to_device_ms;
     cudaEventElapsedTime(&copy_to_device_ms, start, stop);
 
-    // Kernel
+    // Kernel с выделением shared memory
     int numBlocks = (total_chars + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    // Выделяем shared memory для offsets и keys (2 * BLOCK_SIZE * sizeof(int))
+    size_t shared_mem_size = 2 * BLOCK_SIZE * sizeof(int);
 
     cudaEventRecord(start);
-    obfuscateKernel<<<numBlocks, BLOCK_SIZE>>>(d_data, d_offsets, d_keys, num_strings, total_chars);
+    obfuscateKernel<<<numBlocks, BLOCK_SIZE, shared_mem_size>>>(d_data, d_offsets, d_keys, num_strings, total_chars);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
+
+    // Проверка на ошибки выполнения kernel
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("ERROR: Kernel execution failed: %s\n", cudaGetErrorString(err));
+    }
 
     float kernel_ms;
     cudaEventElapsedTime(&kernel_ms, start, stop);
@@ -175,7 +198,8 @@ int main() {
 
     // Применяем обфускацию ещё раз
     cudaMemcpy(d_data, h_data, total_chars, cudaMemcpyHostToDevice);
-    obfuscateKernel<<<numBlocks, BLOCK_SIZE>>>(d_data, d_offsets, d_keys, num_strings, total_chars);
+    obfuscateKernel<<<numBlocks, BLOCK_SIZE, shared_mem_size>>>(d_data, d_offsets, d_keys, num_strings, total_chars);
+    cudaDeviceSynchronize();  // Явная синхронизация для предотвращения race conditions
     cudaMemcpy(h_data, d_data, total_chars, cudaMemcpyDeviceToHost);
 
     // Сравниваем с оригиналом
@@ -195,7 +219,8 @@ int main() {
     // Восстанавливаем и обфусцируем для отображения
     memcpy(h_data, h_original, total_chars);
     cudaMemcpy(d_data, h_data, total_chars, cudaMemcpyHostToDevice);
-    obfuscateKernel<<<numBlocks, BLOCK_SIZE>>>(d_data, d_offsets, d_keys, num_strings, total_chars);
+    obfuscateKernel<<<numBlocks, BLOCK_SIZE, shared_mem_size>>>(d_data, d_offsets, d_keys, num_strings, total_chars);
+    cudaDeviceSynchronize();  // Явная синхронизация
     cudaMemcpy(h_data, d_data, total_chars, cudaMemcpyDeviceToHost);
 
     printf("\n=== Obfuscation Examples ===\n");

@@ -31,7 +31,8 @@ typedef struct {
 } RootkitAnalysis;
 
 // Известные сигнатуры руткитов
-__constant__ char d_rootkit_signatures[20][32] = {
+// Выравнивание для оптимального доступа из constant memory
+__constant__ __align__(16) char d_rootkit_signatures[20][32] = {
     "necurs", "zeroaccess", "tdss", "rustock", "mebroot",
     "bootkit", "stuxnet", "flame", "duqu", "regin",
     "turla", "equation", "careto", "darkhotel", "grayfish",
@@ -40,32 +41,40 @@ __constant__ char d_rootkit_signatures[20][32] = {
 
 // Device функции
 __device__ int d_strlen(const char* str) {
+    if (!str) return 0;
     int len = 0;
-    while (str[len] != '\0' && len < MAX_PROCESS_NAME) len++;
+    while (len < MAX_PROCESS_NAME && str[len] != '\0') len++;
     return len;
 }
 
 __device__ void d_tolower_copy(char* dst, const char* src, int max_len) {
+    if (!dst || !src || max_len <= 0) return;
     int i = 0;
-    while (src[i] != '\0' && i < max_len - 1) {
+    while (i < max_len - 1 && src[i] != '\0') {
         char c = src[i];
         if (c >= 'A' && c <= 'Z') c = c + 32;
         dst[i] = c;
         i++;
     }
-    dst[i] = '\0';
+    if (i < max_len) dst[i] = '\0';
 }
 
 __device__ int d_strstr_check(const char* haystack, const char* needle) {
+    if (!haystack || !needle) return 0;
+
     int h_len = d_strlen(haystack);
     int n_len = 0;
-    while (needle[n_len] != '\0') n_len++;
+    while (n_len < 32 && needle[n_len] != '\0') n_len++;
 
     if (n_len == 0 || n_len > h_len) return 0;
 
     for (int i = 0; i <= h_len - n_len; i++) {
         int match = 1;
         for (int j = 0; j < n_len; j++) {
+            if (i + j >= MAX_PROCESS_NAME) {
+                match = 0;
+                break;
+            }
             if (haystack[i + j] != needle[j]) {
                 match = 0;
                 break;
@@ -88,7 +97,7 @@ __global__ void detectSSDTHooks(const SSDTEntry* ssdt, RootkitAnalysis* results,
 
     if (orig != curr) {
         results[idx].ssdt_hook_detected = 1;
-        results[idx].total_score += 50;  // Высокий приоритет
+        atomicAdd(&results[idx].total_score, 50);  // Атомарное добавление
     } else {
         results[idx].ssdt_hook_detected = 0;
     }
@@ -115,7 +124,7 @@ __global__ void signatureAnalysis(const ProcessInfo* processes, RootkitAnalysis*
 
     if (match_found) {
         results[idx].signature_match = 1;
-        results[idx].total_score += 40;
+        atomicAdd(&results[idx].total_score, 40);  // Атомарное добавление
     } else {
         results[idx].signature_match = 0;
     }
@@ -133,7 +142,7 @@ __global__ void processTreeVerification(const ProcessInfo* processes, RootkitAna
     // Процесс с ppid=0, но не init (pid=1) - подозрительный
     if (ppid == 0 && pid != 1 && pid != 0) {
         results[idx].orphan_process = 1;
-        results[idx].total_score += 30;
+        atomicAdd(&results[idx].total_score, 30);  // Атомарное добавление
     } else {
         results[idx].orphan_process = 0;
     }
@@ -171,7 +180,7 @@ __global__ void heuristicAnalysis(const ProcessInfo* processes, RootkitAnalysis*
     }
 
     results[idx].heuristic_score = score;
-    results[idx].total_score += score;
+    atomicAdd(&results[idx].total_score, score);  // Атомарное добавление
 }
 
 void generateProcessData(ProcessInfo* processes, int n) {

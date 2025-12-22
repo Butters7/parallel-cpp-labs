@@ -15,10 +15,6 @@ typedef struct {
     int overflow_amount;  // на сколько превышен лимит
 } AnalysisResult;
 
-// =============================================================================
-// CUDA Kernel для анализа переполнения буфера
-// =============================================================================
-
 __global__ void analyzeBufferOverflow(const char* strings, AnalysisResult* results,
                                        const int* limits, int n, int string_size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -28,9 +24,11 @@ __global__ void analyzeBufferOverflow(const char* strings, AnalysisResult* resul
     const char* str = &strings[idx * string_size];
     int limit = limits[idx];
 
-    // Вычисляем длину строки
+    // Вычисляем длину строки с гарантированными границами
     int len = 0;
-    while (str[len] != '\0' && len < string_size) {
+    // Явная проверка границ для предотвращения переполнения
+    while (len < string_size) {
+        if (str[len] == '\0') break;
         len++;
     }
 
@@ -47,18 +45,16 @@ __global__ void analyzeBufferOverflow(const char* strings, AnalysisResult* resul
     }
 }
 
-// =============================================================================
-// CPU версия для сравнения производительности
-// =============================================================================
-
 void analyzeBufferOverflowCPU(const char* strings, AnalysisResult* results,
                                const int* limits, int n, int string_size) {
     for (int idx = 0; idx < n; idx++) {
         const char* str = &strings[idx * string_size];
         int limit = limits[idx];
 
+        // Вычисляем длину строки с гарантированными границами
         int len = 0;
-        while (str[len] != '\0' && len < string_size) {
+        while (len < string_size) {
+            if (str[len] == '\0') break;
             len++;
         }
 
@@ -74,10 +70,6 @@ void analyzeBufferOverflowCPU(const char* strings, AnalysisResult* results,
         }
     }
 }
-
-// =============================================================================
-// Генерация тестовых данных
-// =============================================================================
 
 void generateTestData(char* strings, int* limits, int n, int string_size,
                       int min_limit, int max_limit, float overflow_ratio) {
@@ -117,17 +109,12 @@ void generateTestData(char* strings, int* limits, int n, int string_size,
     }
 }
 
-// =============================================================================
-// Вывод результатов
-// =============================================================================
-
 void printResults(const char* strings, AnalysisResult* results, int n,
                   int string_size, int max_display) {
     printf("\n%-6s | %-8s | %-6s | %-10s | %-30s\n",
            "Index", "Status", "Limit", "Length", "String (truncated)");
     printf("-------+----------+--------+------------+--------------------------------\n");
 
-    int displayed = 0;
     int overflows_shown = 0;
     int normal_shown = 0;
 
@@ -197,10 +184,6 @@ void printStatistics(AnalysisResult* results, int n) {
     }
 }
 
-// =============================================================================
-// Main
-// =============================================================================
-
 int main() {
     printf("==============================================\n");
     printf("  Buffer Overflow Analyzer (CUDA)\n");
@@ -250,6 +233,10 @@ int main() {
 
     if (!h_strings || !h_limits || !h_results_gpu || !h_results_cpu) {
         printf("ERROR: Host memory allocation failed!\n");
+        if (h_strings) free(h_strings);
+        if (h_limits) free(h_limits);
+        if (h_results_gpu) free(h_results_gpu);
+        if (h_results_cpu) free(h_results_cpu);
         return 1;
     }
 
@@ -263,14 +250,29 @@ int main() {
     int* d_limits;
     AnalysisResult* d_results;
 
-    cudaMalloc(&d_strings, strings_size);
-    cudaMalloc(&d_limits, limits_size);
-    cudaMalloc(&d_results, results_size);
+    cudaError_t err;
+    err = cudaMalloc(&d_strings, strings_size);
+    if (err != cudaSuccess) {
+        printf("ERROR: cudaMalloc failed for d_strings: %s\n", cudaGetErrorString(err));
+        free(h_strings); free(h_limits); free(h_results_gpu); free(h_results_cpu);
+        return 1;
+    }
+    err = cudaMalloc(&d_limits, limits_size);
+    if (err != cudaSuccess) {
+        printf("ERROR: cudaMalloc failed for d_limits: %s\n", cudaGetErrorString(err));
+        cudaFree(d_strings);
+        free(h_strings); free(h_limits); free(h_results_gpu); free(h_results_cpu);
+        return 1;
+    }
+    err = cudaMalloc(&d_results, results_size);
+    if (err != cudaSuccess) {
+        printf("ERROR: cudaMalloc failed for d_results: %s\n", cudaGetErrorString(err));
+        cudaFree(d_strings); cudaFree(d_limits);
+        free(h_strings); free(h_limits); free(h_results_gpu); free(h_results_cpu);
+        return 1;
+    }
 
-    // ==========================================================
     // GPU анализ
-    // ==========================================================
-
     printf("=== GPU Analysis ===\n");
 
     cudaEvent_t start, stop;
@@ -295,6 +297,15 @@ int main() {
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
 
+    // Проверка на ошибки выполнения kernel
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("ERROR: Kernel launch failed: %s\n", cudaGetErrorString(err));
+        cudaFree(d_strings); cudaFree(d_limits); cudaFree(d_results);
+        free(h_strings); free(h_limits); free(h_results_gpu); free(h_results_cpu);
+        return 1;
+    }
+
     float kernel_ms;
     cudaEventElapsedTime(&kernel_ms, start, stop);
 
@@ -315,10 +326,7 @@ int main() {
     printf("  Total GPU:     %.3f ms\n", total_gpu_ms);
     printf("  Throughput:    %.2f million strings/sec\n\n", n / (total_gpu_ms / 1000.0) / 1000000.0);
 
-    // ==========================================================
     // CPU анализ (для сравнения)
-    // ==========================================================
-
     printf("=== CPU Analysis ===\n");
 
     clock_t cpu_start = clock();
@@ -330,10 +338,7 @@ int main() {
     printf("  Total CPU:     %.3f ms\n", cpu_ms);
     printf("  Throughput:    %.2f million strings/sec\n\n", n / (cpu_ms / 1000.0) / 1000000.0);
 
-    // ==========================================================
     // Сравнение производительности
-    // ==========================================================
-
     float speedup = cpu_ms / total_gpu_ms;
     float kernel_speedup = cpu_ms / kernel_ms;
 
@@ -350,10 +355,7 @@ int main() {
     printf("Target speedup (100x): %s\n", speedup >= 100 ? "PASS" :
            (kernel_speedup >= 100 ? "PASS (kernel)" : "FAIL"));
 
-    // ==========================================================
     // Верификация результатов
-    // ==========================================================
-
     printf("\n=== Verification ===\n");
     int mismatches = 0;
     for (int i = 0; i < n; i++) {
@@ -382,10 +384,6 @@ int main() {
     // Вывод статистики и примеров
     printStatistics(h_results_gpu, n);
     printResults(h_strings, h_results_gpu, n, string_size, 10);
-
-    // ==========================================================
-    // Пакетная обработка (демонстрация)
-    // ==========================================================
 
     printf("\n=== Batch Processing Demo ===\n");
 
