@@ -7,8 +7,10 @@
 #include <queue>
 #include <thread>
 #include <mutex>
-#include <condition_variable> // Для std::condition_variable - синхронизация потоков
-#include <future>             // Для std::future - получение результатов из потоков
+#include <condition_variable>
+#include <future>
+#include <atomic>
+#include <memory>
 
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* data) {
     size_t newLength = size * nmemb;
@@ -20,30 +22,45 @@ static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::stri
     }
 }
 
-std::string make_get(const std::string& url) {
-    CURL* curl;
-    CURLcode res;
-    std::string response_data;
+// RAII обертка для CURL - автоматически освобождает ресурсы
+class CurlHandle {
+public:
+    CurlHandle() : curl(curl_easy_init()) {}
+    ~CurlHandle() {
+        if (curl) {
+            curl_easy_cleanup(curl);
+        }
+    }
 
-    curl_global_init(CURL_GLOBAL_DEFAULT);
-    curl = curl_easy_init();
+    // Запрет копирования
+    CurlHandle(const CurlHandle&) = delete;
+    CurlHandle& operator=(const CurlHandle&) = delete;
+
+    CURL* get() { return curl; }
+    operator bool() const { return curl != nullptr; }
+
+private:
+    CURL* curl;
+};
+
+std::string make_get(const std::string& url) {
+    std::string response_data;
+    CurlHandle curl;
 
     if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response_data);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_USERAGENT, "libcurl-link-parser/1.0");
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+        curl_easy_setopt(curl.get(), CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &response_data);
+        curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl.get(), CURLOPT_USERAGENT, "libcurl-link-parser/1.0");
+        curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT, 10L);
 
-        res = curl_easy_perform(curl);
+        CURLcode res = curl_easy_perform(curl.get());
 
         if (res != CURLE_OK) {
             std::cerr << "curl_easy_perform() failed: " << curl_easy_strerror(res) << std::endl;
         }
-        curl_easy_cleanup(curl);
     }
-    curl_global_cleanup();
     return response_data;
 }
 
@@ -132,11 +149,14 @@ std::vector<std::string> extractURLs(const std::string& url, const std::string& 
 }
 
 int main() {
+    // Инициализация CURL один раз для всей программы
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
     std::string start_url;
-    
+
     std::cout << "Ведите URL: ";
     std::cin >> start_url;
-    
+
     std::string target_domain = getDomain(start_url);
     std::cout << "Текущий домен domain: " << target_domain << std::endl;
 
@@ -144,72 +164,58 @@ int main() {
     std::queue<std::string> to_visit;
     std::vector<std::string> all_links;
 
-    // Мьютекс для защиты общих структур данных (visited, to_visit, all_links)
-    // Нужен, т.к. несколько потоков будут одновременно читать и писать в эти структуры
     std::mutex mtx;
-
-    // Condition variable для уведомления о появлении новых URL в очереди
-    // Потоки будут ждать на cv, когда очередь пуста, и просыпаться при добавлении URL
     std::condition_variable cv;
 
-    // Счётчик активных задач - сколько потоков сейчас обрабатывают URL
-    int active_tasks = 0;
+    // Используем atomic для безопасного доступа из разных потоков
+    std::atomic<int> processed_pages{0};
+    std::atomic<int> active_tasks{0};
+    std::atomic<bool> done{false};
 
     to_visit.push(start_url);
     visited.insert(start_url);
     all_links.push_back(start_url);
 
-    int max_pages = 50;
-    int processed_pages = 0;
-    bool done = false;  // Флаг завершения работы
+    const int max_pages = 50;
 
-    // Определяем количество потоков
     int numThreads = std::thread::hardware_concurrency();
     if (numThreads == 0) numThreads = 4;
 
-    // Создаём рабочие потоки
     std::vector<std::thread> threads;
     for (int t = 0; t < numThreads; t++) {
         threads.emplace_back([&]() {
             while (true) {
                 std::string current_url;
 
-                // Блок с захватом мьютекса для получения URL из очереди чтобы не анлочить вручную работу
                 {
-                    // unique_lock позволяет освобождать мьютекс при ожидании на cv
                     std::unique_lock<std::mutex> lock(mtx);
 
-                    // Ждём пока появится URL в очереди ИЛИ работа завершена
-                    // condition_variable::wait освобождает мьютекс на время ожидания
                     cv.wait(lock, [&]() {
-                        return !to_visit.empty() || done;
+                        return !to_visit.empty() || done.load();
                     });
 
-                    // Если работа завершена и очередь пуста - выходим
-                    if (done && to_visit.empty()) {
+                    if (done.load() && to_visit.empty()) {
                         return;
                     }
 
-                    // Проверяем лимит обработанных страниц
-                    if (processed_pages >= max_pages) {
-                        done = true;
-                        cv.notify_all();  // Будим все потоки для завершения
+                    // Проверяем лимит до взятия URL
+                    if (processed_pages.load() >= max_pages) {
+                        done.store(true);
+                        cv.notify_all();
                         return;
                     }
 
-                    // Берём URL из очереди
                     current_url = to_visit.front();
                     to_visit.pop();
-                    processed_pages++;
-                    active_tasks++;  // Увеличиваем счётчик активных задач
+                    processed_pages.fetch_add(1);
+                    active_tasks.fetch_add(1);
                 }
 
                 std::cout << "Обработка: " << current_url << std::endl;
 
-                // Скачиваем и парсим страницу (вне мьютекса - долгая операция)
+                // Скачиваем и парсим страницу (вне мьютекса)
                 std::vector<std::string> new_links = extractURLs(current_url, target_domain);
 
-                // Добавляем найденные ссылки в общие структуры
                 {
                     std::lock_guard<std::mutex> lock(mtx);
                     for (const std::string& link : new_links) {
@@ -219,29 +225,31 @@ int main() {
                             all_links.push_back(link);
                         }
                     }
-                    active_tasks--;  // Уменьшаем счётчик активных задач
 
-                    // Если очередь пуста и нет активных задач - завершаем
-                    if (to_visit.empty() && active_tasks == 0) {
-                        done = true;
+                    active_tasks.fetch_sub(1);
+
+                    // Проверяем условие завершения
+                    if (to_visit.empty() && active_tasks.load() == 0) {
+                        done.store(true);
                     }
                 }
 
-                // Уведомляем другие потоки о новых URL или завершении
                 cv.notify_all();
             }
         });
     }
 
-    // Ждём завершения всех потоков
     for (auto& t : threads) {
         t.join();
     }
-    
+
     std::cout << "\nНайдено " << all_links.size() << " уникальных ссылок для текущего домена " << target_domain << ":" << std::endl;
     for (const std::string& link : all_links) {
         std::cout << link << std::endl;
     }
-    
+
+    // Очистка CURL
+    curl_global_cleanup();
+
     return 0;
 }

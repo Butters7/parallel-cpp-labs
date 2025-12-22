@@ -7,8 +7,10 @@
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
-#include <thread>  // Для создания потоков
-#include <mutex>   // Для синхронизации доступа к общим данным
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <stdexcept>
 
 // Функция для приведения строки к нижнему регистру
 std::string toLower(const std::string& str) {
@@ -46,17 +48,24 @@ bool compareWordCount(const WordCount& a, const WordCount& b) {
 }
 
 int main(int argc, char* argv[]) {
-    // Проверяем аргументы командной строки
     if (argc < 2) {
         std::cerr << "Использование: " << argv[0] << " <файл> [количество слов]" << std::endl;
         return 1;
     }
-    
-    // Получаем имя файла и количество слов для вывода
+
     std::string filename = argv[1];
     int topN = 10;
     if (argc > 2) {
-        topN = std::stoi(argv[2]);
+        try {
+            topN = std::stoi(argv[2]);
+            if (topN <= 0) {
+                std::cerr << "Количество слов должно быть положительным" << std::endl;
+                return 1;
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "Ошибка парсинга количества слов: " << e.what() << std::endl;
+            return 1;
+        }
     }
     
     // Открываем файл
@@ -66,7 +75,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Читаем все строки файла в вектор для параллельной обработки
+    // Читаем все строки файла в вектор
     std::vector<std::string> lines;
     std::string line;
     while (std::getline(file, line)) {
@@ -74,31 +83,29 @@ int main(int argc, char* argv[]) {
     }
     file.close();
 
-    // Определяем количество потоков
+    if (lines.empty()) {
+        std::cout << "Файл пуст" << std::endl;
+        return 0;
+    }
+
     int numThreads = std::thread::hardware_concurrency();
     if (numThreads == 0) numThreads = 4;
-    // Так как size_t конвертим в int без неявных преобразований
     if (numThreads > static_cast<int>(lines.size())) numThreads = lines.size();
 
-    // Вектор локальных карт — каждый поток заполняет свою карту
+    // Используем динамическую балансировку нагрузки
+    std::atomic<size_t> nextLine{0};
     std::vector<std::map<std::string, int>> localMaps(numThreads);
 
-    // Создаём потоки для параллельного подсчёта слов
     std::vector<std::thread> threads;
     for (int t = 0; t < numThreads; t++) {
-        // emplace_back создаёт поток прямо в векторе
-        // Лямбда-функция [&, t]() — анонимная функция, выполняемая потоком
-        // [&, t] — захват переменных: & — все по ссылке, t — по значению (копия)
-        // t копируем, чтобы каждый поток имел свой номер (иначе все увидят последнее значение t)
         threads.emplace_back([&, t]() {
-            // Вычисляем диапазон строк для этого потока
-            int linesPerThread = lines.size() / numThreads;
-            int startLine = t * linesPerThread;
-            int endLine = (t == numThreads - 1) ? lines.size() : startLine + linesPerThread;
+            // Каждый поток берет следующую доступную строку
+            // Это обеспечивает лучшую балансировку нагрузки
+            while (true) {
+                size_t lineIndex = nextLine.fetch_add(1);
+                if (lineIndex >= lines.size()) break;
 
-            // Обрабатываем свои строки, заполняем локальную карту
-            for (int i = startLine; i < endLine; i++) {
-                std::istringstream iss(lines[i]);
+                std::istringstream iss(lines[lineIndex]);
                 std::string word;
                 while (iss >> word) {
                     word = cleanWord(word);
@@ -111,18 +118,38 @@ int main(int argc, char* argv[]) {
         });
     }
 
-    // Ждём завершения всех потоков
     for (auto& t : threads) {
         t.join();
     }
 
-    // Объединяем результаты из всех локальных карт в одну общую
+    // Параллельное объединение результатов
+    // Используем иерархическое слияние
     std::map<std::string, int> wordCountMap;
-    for (const auto& localMap : localMaps) {
-        for (const auto& pair : localMap) {
-            wordCountMap[pair.first] += pair.second;
+
+    // Сначала сливаем пары карт параллельно
+    int numMaps = numThreads;
+    while (numMaps > 1) {
+        std::vector<std::thread> mergeThreads;
+        int pairs = numMaps / 2;
+
+        for (int i = 0; i < pairs; i++) {
+            mergeThreads.emplace_back([&localMaps, i]() {
+                for (const auto& pair : localMaps[2*i + 1]) {
+                    localMaps[2*i][pair.first] += pair.second;
+                }
+                localMaps[2*i + 1].clear();
+            });
         }
+
+        for (auto& t : mergeThreads) {
+            t.join();
+        }
+
+        numMaps = pairs + (numMaps % 2);
     }
+
+    // Финальная карта
+    wordCountMap = std::move(localMaps[0]);
     
     // Преобразуем map в вектор для сортировки
     std::vector<WordCount> wordCounts;

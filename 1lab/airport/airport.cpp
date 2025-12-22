@@ -7,9 +7,10 @@
 #include <iomanip>
 #include <algorithm>
 #include <map>
-#include <thread>             // std::thread - для создания потоков
-#include <mutex>              // std::mutex - для защиты общих данных
-#include <condition_variable> // std::condition_variable - для синхронизации потоков
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
 
 using namespace std;
 using namespace std::chrono;
@@ -153,16 +154,13 @@ private:
     vector<Flight> flights;
     queue<string> landingQueue;
     queue<string> takeoffQueue;
-    int currentTime;
+    atomic<int> currentTime;
 
-    // Мьютекс для защиты общих данных (очередей, рейсов, полос, терминалов)
     mutex mtx;
-
-    // Condition variable для уведомления потоков о новых событиях
     condition_variable cv;
+    condition_variable terminalCv;
 
-    // Флаг завершения симуляции
-    bool simulationRunning;
+    atomic<bool> simulationRunning;
 
 public:
     Airport() : currentTime(0), simulationRunning(false) {
@@ -207,12 +205,11 @@ public:
         thread landingThread([this]() {
             while (true) {
                 unique_lock<mutex> lock(mtx);
-                // Ждём пока появится рейс в очереди на посадку или симуляция завершится
                 cv.wait(lock, [this]() {
-                    return !landingQueue.empty() || !simulationRunning;
+                    return !landingQueue.empty() || !simulationRunning.load();
                 });
 
-                if (!simulationRunning && landingQueue.empty()) break;
+                if (!simulationRunning.load() && landingQueue.empty()) break;
 
                 if (!landingQueue.empty()) {
                     string flightId = landingQueue.front();
@@ -222,7 +219,7 @@ public:
                         for (auto& runway : runways) {
                             if (runway.available && runway.requestLanding(*flightIt)) {
                                 cout << "[Поток посадки] Рейс " << flightId << " начал посадку на полосу " << runway.id << endl;
-                                flightIt->landingTime = currentTime;
+                                flightIt->landingTime = currentTime.load();
                                 landingQueue.pop();
                                 break;
                             }
@@ -236,12 +233,11 @@ public:
         thread takeoffThread([this]() {
             while (true) {
                 unique_lock<mutex> lock(mtx);
-                // Ждём пока появится рейс в очереди на взлёт или симуляция завершится (захватываем указатель чтобы был доступ к полям и методам)
                 cv.wait(lock, [this]() {
-                    return !takeoffQueue.empty() || !simulationRunning;
+                    return !takeoffQueue.empty() || !simulationRunning.load();
                 });
 
-                if (!simulationRunning && takeoffQueue.empty()) break;
+                if (!simulationRunning.load() && takeoffQueue.empty()) break;
 
                 if (!takeoffQueue.empty()) {
                     string flightId = takeoffQueue.front();
@@ -251,7 +247,7 @@ public:
                         for (auto& runway : runways) {
                             if (runway.available && runway.requestTakeoff(*flightIt)) {
                                 cout << "[Поток взлёта] Рейс " << flightId << " начал взлет с полосы " << runway.id << endl;
-                                flightIt->takeoffTime = currentTime;
+                                flightIt->takeoffTime = currentTime.load();
                                 takeoffQueue.pop();
                                 break;
                             }
@@ -263,51 +259,53 @@ public:
 
         // Поток для обработки терминалов - обновляет состояние терминалов
         thread terminalThread([this]() {
-            while (simulationRunning) {
-                {
-                    lock_guard<mutex> lock(mtx);
-                    updateTerminals();
+            while (true) {
+                unique_lock<mutex> lock(mtx);
+                terminalCv.wait(lock, [this]() {
+                    return !simulationRunning.load() || hasActiveTerminals();
+                });
 
-                    // Проверяем готовность рейсов к вылету
-                    for (auto& flight : flights) {
-                        if (flight.status == FlightStatus::AT_TERMINAL && flight.terminalId > 0) {
-                            Terminal& terminal = terminals[flight.terminalId - 1];
+                if (!simulationRunning.load()) break;
 
-                            // Если время обработки закончилось - рейс готов к вылету
-                            if (terminal.timeRemaining == 0) {
-                                flight.status = FlightStatus::READY_FOR_TAKEOFF;
-                                cout << "[Поток терминалов] Рейс " << flight.id << " готов к вылету." << endl;
-                                terminal.release();  // Освобождаем терминал
-                                flight.terminalId = -1;
-                                takeoffQueue.push(flight.id);
-                                cv.notify_all();  // Уведомляем поток взлётов
-                            }
+                updateTerminals();
+
+                // Проверяем готовность рейсов к вылету
+                for (auto& flight : flights) {
+                    if (flight.status == FlightStatus::AT_TERMINAL && flight.terminalId > 0) {
+                        Terminal& terminal = terminals[flight.terminalId - 1];
+
+                        if (terminal.timeRemaining == 0) {
+                            flight.status = FlightStatus::READY_FOR_TAKEOFF;
+                            cout << "[Поток терминалов] Рейс " << flight.id << " готов к вылету." << endl;
+                            terminal.release();
+                            flight.terminalId = -1;
+                            takeoffQueue.push(flight.id);
+                            cv.notify_all();
                         }
                     }
                 }
-                this_thread::sleep_for(chrono::milliseconds(50));
             }
         });
 
         // Основной цикл симуляции
-        for (currentTime = 0; currentTime <= SIMULATION_TIME; currentTime += TIME_STEP) {
+        for (int t = 0; t <= SIMULATION_TIME; t += TIME_STEP) {
+            currentTime.store(t);
             {
                 lock_guard<mutex> lock(mtx);
-                processScheduledFlights();  // Обработка рейсов по расписанию
-                processLandingCompletion(); // Завершение посадки
-                processTakeoffCompletion(); // Завершение взлёта
+                processScheduledFlights();
+                processLandingCompletion();
+                processTakeoffCompletion();
             }
-            cv.notify_all();  // Уведомляем рабочие потоки
+            cv.notify_all();
+            terminalCv.notify_all();
             displayStatus();
-            this_thread::sleep_for(chrono::milliseconds(100));  // Пауза для наглядности
+            this_thread::sleep_for(chrono::milliseconds(100));
         }
 
         // Завершаем симуляцию
-        {
-            lock_guard<mutex> lock(mtx);
-            simulationRunning = false;
-        }
-        cv.notify_all();  // Будим все потоки для завершения
+        simulationRunning.store(false);
+        cv.notify_all();
+        terminalCv.notify_all();
 
         // Ожидаем завершения всех потоков
         landingThread.join();
@@ -319,40 +317,49 @@ public:
     }
     
 private:
+    // Проверяет есть ли активные терминалы с рейсами
+    bool hasActiveTerminals() const {
+        for (const auto& terminal : terminals) {
+            if (!terminal.available) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     // Обработка рейсов по расписанию - добавляет в очередь на посадку
     void processScheduledFlights() {
+        int time = currentTime.load();
         for (auto& flight : flights) {
-            if (flight.status == FlightStatus::SCHEDULED && flight.scheduledTime <= currentTime) {
+            if (flight.status == FlightStatus::SCHEDULED && flight.scheduledTime <= time) {
                 cout << "Рейс " << flight.id << " запрашивает посадку." << endl;
-                // Не меняем статус здесь - он изменится когда поток посадки назначит полосу
                 landingQueue.push(flight.id);
-                flight.status = FlightStatus::LANDED;  // Временный статус "в очереди"
+                flight.status = FlightStatus::LANDED;
             }
         }
     }
 
     // Обработка завершения посадки и назначение терминала
     void processLandingCompletion() {
+        int time = currentTime.load();
         for (auto& flight : flights) {
-            // Проверяем что рейс садится И прошло достаточно времени И landingTime установлен
             if (flight.status == FlightStatus::LANDING &&
                 flight.landingTime > 0 &&
-                currentTime - flight.landingTime >= 2) {
+                time - flight.landingTime >= 2) {
 
                 flight.status = FlightStatus::LANDED;
                 cout << "Рейс " << flight.id << " завершил посадку." << endl;
 
-                // Освобождаем полосу
                 if (flight.runwayId > 0) {
                     runways[flight.runwayId - 1].release();
                     flight.runwayId = -1;
                 }
 
-                // Пытаемся назначить терминал
                 for (auto& terminal : terminals) {
                     if (terminal.available && terminal.assignFlight(flight)) {
                         cout << "Рейс " << flight.id << " направлен в терминал " << terminal.id << endl;
-                        flight.terminalTime = currentTime;
+                        flight.terminalTime = time;
+                        terminalCv.notify_all();
                         break;
                     }
                 }
@@ -362,15 +369,15 @@ private:
 
     // Обработка завершения взлёта
     void processTakeoffCompletion() {
+        int time = currentTime.load();
         for (auto& flight : flights) {
             if (flight.status == FlightStatus::TAKING_OFF &&
                 flight.takeoffTime > 0 &&
-                currentTime - flight.takeoffTime >= 2) {
+                time - flight.takeoffTime >= 2) {
 
                 flight.status = FlightStatus::DEPARTED;
                 cout << "Рейс " << flight.id << " вылетел." << endl;
 
-                // Освобождаем полосу
                 if (flight.runwayId > 0) {
                     runways[flight.runwayId - 1].release();
                     flight.runwayId = -1;
@@ -386,8 +393,9 @@ private:
     }
     
     void displayStatus() {
-        if (currentTime % 10 == 0) { // Выводим статус каждые 10 единиц времени
-            cout << "\n=== Время: " << currentTime << " ===" << endl;
+        int time = currentTime.load();
+        if (time % 10 == 0) {
+            cout << "\n=== Время: " << time << " ===" << endl;
             cout << "Очередь на посадку: " << landingQueue.size() << endl;
             cout << "Очередь на взлет: " << takeoffQueue.size() << endl;
             

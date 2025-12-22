@@ -4,6 +4,8 @@
 #include <climits>
 #include <algorithm>
 #include <thread>
+#include <barrier>
+#include <functional>
 
 using namespace std;
 
@@ -23,45 +25,58 @@ FloydWarshall::FloydWarshall(const vector<vector<int>>& graph) {
 }
 
 void FloydWarshall::run() {
-    // Определяем количество потоков (по числу ядер процессора)
     int numThreads = thread::hardware_concurrency();
     if (numThreads == 0) numThreads = 4;
     if (numThreads > n) numThreads = n;
 
-    // Внешний цикл по k - промежуточная вершина
-    for (int k = 0; k < n; k++) {
-        vector<thread> threads;
+    // Используем барьер для синхронизации между итерациями
+    // Барьер освобождается когда все потоки достигают его
+    barrier sync_point(numThreads);
 
-        // Создаём потоки для параллельной обработки строк матрицы
-        // Каждый поток обрабатывает свой диапазон строк i
-        for (int t = 0; t < numThreads; t++) {
-            threads.emplace_back([&, t, k]() {
-                // Вычисляем диапазон строк для этого потока
-                int rowsPerThread = n / numThreads;
-                int startRow = t * rowsPerThread;
-                int endRow = (t == numThreads - 1) ? n : startRow + rowsPerThread;
+    // Создаём потоки один раз, а не на каждой итерации
+    vector<thread> threads;
 
-                // Обрабатываем строки [startRow, endRow)
-                // Параллелизм безопасен: разные потоки пишут в разные строки
+    for (int t = 0; t < numThreads; t++) {
+        threads.emplace_back([&, t]() {
+            // Каждый поток знает свой диапазон строк
+            int rowsPerThread = n / numThreads;
+            int startRow = t * rowsPerThread;
+            int endRow = (t == numThreads - 1) ? n : startRow + rowsPerThread;
+
+            // Внешний цикл по k выполняется каждым потоком
+            for (int k = 0; k < n; k++) {
+                // Обрабатываем только свои строки
+                // Используем блочное распределение вместо построчного
+                // чтобы уменьшить false sharing
                 for (int i = startRow; i < endRow; i++) {
-                    for (int j = 0; j < n; j++) {
-                        if (dist[i][k] != INT_MAX && dist[k][j] != INT_MAX) {
-                            if (dist[i][j] > dist[i][k] + dist[k][j]) {
-                                dist[i][j] = dist[i][k] + dist[k][j];
-                                next[i][j] = next[i][k];
+                    // Кэшируем dist[i][k] чтобы избежать повторных обращений
+                    int dist_ik = dist[i][k];
+                    if (dist_ik != INT_MAX) {
+                        for (int j = 0; j < n; j++) {
+                            int dist_kj = dist[k][j];
+                            if (dist_kj != INT_MAX) {
+                                int new_dist = dist_ik + dist_kj;
+                                if (dist[i][j] > new_dist) {
+                                    dist[i][j] = new_dist;
+                                    next[i][j] = next[i][k];
+                                }
                             }
                         }
                     }
                 }
-            });
-        }
 
-        // Ждём завершения всех потоков перед следующей итерацией k
-        for (auto& t : threads) {
-            t.join();
-        }
+                // Все потоки ждут здесь перед переходом к следующему k
+                sync_point.arrive_and_wait();
+            }
+        });
     }
 
+    // Ждём завершения всех потоков
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // Проверка на отрицательные циклы
     for (int i = 0; i < n; i++) {
         if (dist[i][i] < 0) {
             hasNegativeCycle = true;
