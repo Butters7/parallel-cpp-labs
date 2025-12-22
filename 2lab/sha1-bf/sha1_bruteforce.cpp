@@ -119,7 +119,6 @@ bool strcpy_compact(char* dest, const char* src, size_t dest_size) {
     }
 
     // Безопасное копирование
-    char* ptr = dest;
     while ((*dest++ = *src++) != '\0');
 
     return true;
@@ -237,15 +236,18 @@ void dictionary_attack(uint8_t* target_hash, const char* dict_filename, size_t s
         sha1(candidate, length, hash);
 
         if (hash_matches(hash, target_hash)) {
-            // Используем critical section для атомарности всей операции
-            // Иначе несколько потоков могут одновременно пройти проверку и записать
-            // разные значения в found_index (race condition)
-            #pragma omp critical
-            {
-                if (!found) {
-                    found = 1;
-                    found_index = i;
-                }
+            // ИСПРАВЛЕНО для GPU: atomic capture вместо critical section
+            // Critical sections не поддерживаются в GPU offload regions
+            // Atomic capture гарантирует что только первый нашедший поток установит found=1
+            // found_index может быть записан несколькими потоками (race window),
+            // но это не критично - все значения корректны (соответствуют паролю)
+            int was_found;
+            #pragma omp atomic capture
+            { was_found = found; found = 1; }
+
+            // Только потоки, которые первыми увидели found==0, запишут индекс
+            if (was_found == 0) {
+                found_index = i;
             }
         }
     }
@@ -311,15 +313,14 @@ void brute_force_attack(uint8_t* target_hash, int min_length, int max_length) {
             sha1(candidate, len, hash);
 
             if (hash_matches(hash, target_hash)) {
-                // Используем critical section для атомарности всей операции
-                // Иначе несколько потоков могут одновременно пройти проверку и записать
-                // разные значения в found_index (race condition)
-                #pragma omp critical
-                {
-                    if (!found) {
-                        found = 1;
-                        found_index = i;
-                    }
+                // ИСПРАВЛЕНО для GPU: atomic capture вместо critical section
+                // Critical sections не поддерживаются в GPU offload regions
+                int was_found;
+                #pragma omp atomic capture
+                { was_found = found; found = 1; }
+
+                if (was_found == 0) {
+                    found_index = i;
                 }
             }
         }
