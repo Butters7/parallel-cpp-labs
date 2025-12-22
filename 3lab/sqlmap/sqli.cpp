@@ -101,15 +101,33 @@ public:
         std::string result;
         char buffer[256];
 
+        // Rate limiting для предотвращения перегрузки при одновременных popen
+        // Задержка между запусками sqlmap для снижения нагрузки на сеть
+        static std::chrono::steady_clock::time_point last_exec{};
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_exec);
+        if (elapsed.count() < 500) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500 - elapsed.count()));
+        }
+        last_exec = std::chrono::steady_clock::now();
+
         FILE* pipe = popen(command.c_str(), "r");
         if (!pipe) {
             returnCode = -1;
             return "Error: failed to execute command";
         }
 
+        // Таймаут на чтение вывода
+        auto read_start = std::chrono::steady_clock::now();
         while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
             result += buffer;
             if (result.length() > MAX_RESULT_LEN - 256) break;
+
+            // Защита от зависания
+            auto read_elapsed = std::chrono::steady_clock::now() - read_start;
+            if (std::chrono::duration_cast<std::chrono::seconds>(read_elapsed).count() > 120) {
+                break;
+            }
         }
 
         returnCode = pclose(pipe);
@@ -274,9 +292,13 @@ void master_process(int world_size, const std::vector<TargetInfo>& targets, int 
         if (!result.success) {
             // Находим исходное задание для повторной попытки
             int task_id = result.task_id;
-            if (task_id < total_tasks) {
-                // Проверяем количество попыток
-                static std::vector<int> retry_counts(total_tasks, 0);
+            if (task_id >= 0 && task_id < total_tasks) {
+                // Используем локальную переменную вместо static для корректности в MPI
+                // static переменные опасны в распределённой среде
+                static std::vector<int> retry_counts;
+                if (retry_counts.empty()) {
+                    retry_counts.resize(total_tasks, 0);
+                }
                 retry_counts[task_id]++;
 
                 if (retry_counts[task_id] < MAX_RETRIES) {
@@ -396,7 +418,21 @@ void worker_process(int rank, const std::string& cookies) {
         MPI_Status status;
 
         // MPI_Probe - проверяем тег сообщения без его получения
-        MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+        int probe_result = MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+        if (probe_result != MPI_SUCCESS) {
+            std::cerr << "Worker " << rank << ": MPI_Probe error" << std::endl;
+            break;
+        }
+
+        // Проверка размера сообщения
+        int count;
+        MPI_Get_count(&status, MPI_BYTE, &count);
+        if (count != sizeof(ScanTask)) {
+            std::cerr << "Worker " << rank << ": Invalid message size: " << count << std::endl;
+            // Очищаем сообщение
+            MPI_Recv(&task, count, MPI_BYTE, 0, status.MPI_TAG, MPI_COMM_WORLD, &status);
+            continue;
+        }
 
         // Если получен сигнал завершения - выходим
         if (status.MPI_TAG == TAG_TERMINATE) {

@@ -31,6 +31,8 @@ struct ScanResult {
 // scan_rate - задержка между запросами (мс) для регулирования скорости
 ScanResult scan_ip(const std::string& ip, int worker_rank, int scan_rate = 100) {
     ScanResult result;
+    // Безопасное копирование с гарантированной нуль-терминацией
+    std::memset(&result, 0, sizeof(ScanResult));
     std::strncpy(result.ip, ip.c_str(), MAX_IP_LEN - 1);
     result.ip[MAX_IP_LEN - 1] = '\0';
     result.success = 0;
@@ -38,22 +40,31 @@ ScanResult scan_ip(const std::string& ip, int worker_rank, int scan_rate = 100) 
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
-    // Динамическое регулирование скорости сканирования
-    // Задержка перед сканированием для избежания перегрузки сети
+    // Rate limiting для предотвращения перегрузки сети
+    // sleep_for безопасен в MPI worker'ах - не блокирует другие процессы
     std::this_thread::sleep_for(std::chrono::milliseconds(scan_rate));
 
     std::stringstream command;
-    // -T4 - агрессивное сканирование, можно менять для регулирования скорости
-    command << "nmap -sV -sC -T4 " << ip << " 2>/dev/null";
+    // Добавляем таймаут для nmap чтобы избежать зависания
+    command << "timeout 30 nmap -sV -sC -T4 " << ip << " 2>/dev/null";
 
-    // Выполняем команду и читаем вывод
+    // popen в MPI worker: каждый worker выполняет в своем процессе
+    // не создает конкуренции между процессами
     FILE* pipe = popen(command.str().c_str(), "r");
     if (pipe) {
         char buffer[128];
         std::string output;
+        // Ограничиваем время чтения вывода
+        auto read_start = std::chrono::steady_clock::now();
         while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
             output += buffer;
-            if (output.length() > MAX_RESULT_LEN - 128) break;  // Ограничиваем размер
+            if (output.length() > MAX_RESULT_LEN - 128) break;
+
+            // Защита от зависания на чтении
+            auto elapsed = std::chrono::steady_clock::now() - read_start;
+            if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() > 35) {
+                break;
+            }
         }
         int status = pclose(pipe);
 
@@ -112,7 +123,9 @@ void master_process(int world_size, const std::vector<std::string>& ip_range) {
     // MPI_Send отправляет данные конкретному процессу
     for (int worker = 1; worker < world_size && next_task < total_tasks; worker++) {
         char ip_buffer[MAX_IP_LEN];
+        std::memset(ip_buffer, 0, MAX_IP_LEN);
         std::strncpy(ip_buffer, ip_range[next_task].c_str(), MAX_IP_LEN - 1);
+        ip_buffer[MAX_IP_LEN - 1] = '\0';
 
         // MPI_Send(data, count, datatype, dest, tag, comm)
         // Отправляем IP-адрес worker'у для сканирования
@@ -129,8 +142,30 @@ void master_process(int world_size, const std::vector<std::string>& ip_range) {
         ScanResult result;
         MPI_Status status;
 
+        // Используем MPI_Probe для проверки наличия сообщения
+        // Это позволяет добавить логику таймаута через неблокирующий опрос
+        int flag = 0;
+        auto timeout_start = std::chrono::steady_clock::now();
+
+        // Polling loop с таймаутом 60 секунд
+        while (!flag) {
+            MPI_Iprobe(MPI_ANY_SOURCE, TAG_RESULT, MPI_COMM_WORLD, &flag, &status);
+            if (!flag) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                auto elapsed = std::chrono::steady_clock::now() - timeout_start;
+                if (std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() > 60) {
+                    std::cerr << "MASTER: Timeout waiting for worker response" << std::endl;
+                    break;
+                }
+            }
+        }
+
+        if (!flag) {
+            // Таймаут - пропускаем
+            continue;
+        }
+
         // MPI_Recv с MPI_ANY_SOURCE - получаем результат от любого worker'а
-        // Это позволяет динамически балансировать нагрузку
         MPI_Recv(&result, sizeof(ScanResult), MPI_BYTE, MPI_ANY_SOURCE,
                  TAG_RESULT, MPI_COMM_WORLD, &status);
 

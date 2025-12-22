@@ -9,6 +9,7 @@
 #include <iomanip>
 #include <fstream>
 #include <cstring>
+#include <climits>
 #include <algorithm>  // std::find
 
 // Теги для MPI сообщений
@@ -268,8 +269,15 @@ void master_process(int world_size, int total_packets) {
         // Сначала отправляем количество пакетов
         MPI_Send(&count, 1, MPI_INT, worker, TAG_PACKETS, MPI_COMM_WORLD);
 
-        // Затем отправляем сами пакеты
-        MPI_Send(&all_packets[offset], count * sizeof(NetworkPacket), MPI_BYTE,
+        // Проверка размера данных перед отправкой
+        int message_size = count * sizeof(NetworkPacket);
+        if (message_size > INT_MAX / 2) {
+            std::cerr << "MASTER: Packet batch too large for worker " << worker << std::endl;
+            continue;
+        }
+
+        // Затем отправляем сами пакеты (NetworkPacket - POD структура)
+        MPI_Send(&all_packets[offset], message_size, MPI_BYTE,
                  worker, TAG_PACKETS, MPI_COMM_WORLD);
 
         std::cout << "MASTER: Отправил " << count << " пакетов worker'у " << worker << std::endl;
@@ -369,9 +377,16 @@ void worker_process(int rank) {
         // Получаем количество пакетов
         MPI_Recv(&packet_count, 1, MPI_INT, 0, TAG_PACKETS, MPI_COMM_WORLD, &status);
 
+        // Проверка размера перед выделением памяти
+        if (packet_count < 0 || packet_count > 10000000) {
+            std::cerr << "Worker " << rank << ": Invalid packet count: " << packet_count << std::endl;
+            break;
+        }
+
         // Получаем сами пакеты
         std::vector<NetworkPacket> packets(packet_count);
-        MPI_Recv(packets.data(), packet_count * sizeof(NetworkPacket), MPI_BYTE,
+        int message_size = packet_count * sizeof(NetworkPacket);
+        MPI_Recv(packets.data(), message_size, MPI_BYTE,
                  0, TAG_PACKETS, MPI_COMM_WORLD, &status);
 
         std::cout << "Worker " << rank << ": Получил " << packet_count << " пакетов для анализа" << std::endl;

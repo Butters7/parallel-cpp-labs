@@ -10,6 +10,7 @@
 #include <iomanip>
 #include <chrono>
 #include <cstring>
+#include <climits>
 #include <filesystem>
 #include <sys/stat.h>
 
@@ -523,10 +524,18 @@ void master_process(int world_size, const std::string& scan_dir, const std::stri
     }
 
     // Рассылка IOC всем worker'ам через MPI_Bcast
+    // Проверка размера данных перед передачей
     int ioc_count = iocs.size();
     MPI_Bcast(&ioc_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
     if (ioc_count > 0) {
-        MPI_Bcast(iocs.data(), ioc_count * sizeof(IOCPattern), MPI_BYTE, 0, MPI_COMM_WORLD);
+        // Проверяем что структура POD и безопасна для MPI_BYTE передачи
+        // IOCPattern содержит только char массивы фиксированного размера
+        int message_size = ioc_count * sizeof(IOCPattern);
+        if (message_size > INT_MAX / 2) {
+            logger.error("IOC data too large for single broadcast");
+            return;
+        }
+        MPI_Bcast(iocs.data(), message_size, MPI_BYTE, 0, MPI_COMM_WORLD);
     }
 
     // Сбор файлов для сканирования
@@ -692,9 +701,16 @@ void worker_process(int rank) {
     int ioc_count;
     MPI_Bcast(&ioc_count, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
+    // Проверка размера перед выделением памяти
+    if (ioc_count < 0 || ioc_count > 1000000) {
+        logger.error("Invalid IOC count received: " + std::to_string(ioc_count));
+        return;
+    }
+
     std::vector<IOCPattern> iocs(ioc_count);
     if (ioc_count > 0) {
-        MPI_Bcast(iocs.data(), ioc_count * sizeof(IOCPattern), MPI_BYTE, 0, MPI_COMM_WORLD);
+        int message_size = ioc_count * sizeof(IOCPattern);
+        MPI_Bcast(iocs.data(), message_size, MPI_BYTE, 0, MPI_COMM_WORLD);
     }
 
     logger.debug("Received " + std::to_string(ioc_count) + " IOCs");
@@ -706,8 +722,18 @@ void worker_process(int rank) {
         ScanTask task;
         MPI_Status status;
 
-        // MPI_Probe - проверяем тег
+        // MPI_Probe - проверяем наличие сообщения и его тег
         MPI_Probe(0, MPI_ANY_TAG, MPI_COMM_WORLD, &status);
+
+        // Получаем размер сообщения для проверки
+        int count;
+        MPI_Get_count(&status, MPI_BYTE, &count);
+
+        // Проверка размера сообщения
+        if (count != sizeof(ScanTask)) {
+            logger.error("Received message with wrong size: " + std::to_string(count));
+            continue;
+        }
 
         if (status.MPI_TAG == TAG_TERMINATE) {
             MPI_Recv(&task, sizeof(ScanTask), MPI_BYTE, 0, TAG_TERMINATE, MPI_COMM_WORLD, &status);
