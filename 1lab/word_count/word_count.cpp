@@ -3,7 +3,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <map>
+#include <unordered_map>
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
@@ -11,29 +11,75 @@
 #include <mutex>
 #include <atomic>
 #include <stdexcept>
+#ifdef HAS_TBB
+#include <execution>
+#endif
 
 // Функция для приведения строки к нижнему регистру
+// Оптимизировано: используем std::transform вместо конкатенации
 std::string toLower(const std::string& str) {
     std::string result;
-    for (char c : str) {
-        result += std::tolower(c);
-    }
+    result.reserve(str.size());
+    std::transform(str.begin(), str.end(), std::back_inserter(result),
+                   [](unsigned char c) { return std::tolower(c); });
     return result;
 }
 
 // Функция для очистки слова от знаков препинания
-std::string cleanWord(std::string word) {
-    // Удаляем знаки препинания в начале слова
-    while (!word.empty() && std::ispunct(word.front())) {
-        word.erase(0, 1);
+// Оптимизировано: используем find_if для поиска границ вместо циклов erase
+std::string cleanWord(const std::string& word) {
+    if (word.empty()) return word;
+
+    // Находим первый не-пунктуационный символ
+    auto start = std::find_if(word.begin(), word.end(),
+                              [](unsigned char c) { return !std::ispunct(c); });
+
+    // Находим последний не-пунктуационный символ
+    auto end = std::find_if(word.rbegin(), word.rend(),
+                            [](unsigned char c) { return !std::ispunct(c); }).base();
+
+    if (start >= end) return "";
+
+    return std::string(start, end);
+}
+
+// Функция для парсинга CSV строки с учётом кавычек
+// Возвращает вектор полей
+std::vector<std::string> parseCSVLine(const std::string& line) {
+    std::vector<std::string> fields;
+    std::string field;
+    bool inQuotes = false;
+
+    for (size_t i = 0; i < line.size(); ++i) {
+        char c = line[i];
+
+        if (c == '"') {
+            // Проверяем на экранированную кавычку ""
+            if (inQuotes && i + 1 < line.size() && line[i + 1] == '"') {
+                field += '"';
+                ++i;
+            } else {
+                inQuotes = !inQuotes;
+            }
+        } else if (c == ',' && !inQuotes) {
+            fields.push_back(field);
+            field.clear();
+        } else {
+            field += c;
+        }
     }
-    
-    // Удаляем знаки препинания в конце слова
-    while (!word.empty() && std::ispunct(word.back())) {
-        word.pop_back();
+    fields.push_back(field);
+
+    return fields;
+}
+
+// Извлекает поле prompt из CSV строки (4-й столбец, индекс 3)
+std::string extractPrompt(const std::string& line) {
+    auto fields = parseCSVLine(line);
+    if (fields.size() >= 4) {
+        return fields[3];  // prompt - 4-й столбец
     }
-    
-    return word;
+    return "";
 }
 
 // Структура для хранения слова и его частоты
@@ -54,7 +100,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::string filename = argv[1];
-    int topN = 10;
+    int topN = 20;  // TOP 20 по умолчанию согласно заданию
     if (argc > 2) {
         try {
             topN = std::stoi(argv[2]);
@@ -75,11 +121,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    // Читаем все строки файла в вектор
+    // Читаем все строки файла в вектор, извлекая только поле prompt
     std::vector<std::string> lines;
     std::string line;
+
+    // Пропускаем заголовок CSV
+    if (std::getline(file, line)) {
+        // Заголовок пропущен
+    }
+
+    // Читаем данные и извлекаем поле prompt
     while (std::getline(file, line)) {
-        lines.push_back(line);
+        std::string prompt = extractPrompt(line);
+        if (!prompt.empty()) {
+            lines.push_back(prompt);
+        }
     }
     file.close();
 
@@ -88,30 +144,37 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    int numThreads = std::thread::hardware_concurrency();
+    unsigned int numThreads = std::thread::hardware_concurrency();
     if (numThreads == 0) numThreads = 4;
-    if (numThreads > static_cast<int>(lines.size())) numThreads = lines.size();
+    if (numThreads > lines.size()) numThreads = static_cast<unsigned int>(lines.size());
 
-    // Используем динамическую балансировку нагрузки
-    std::atomic<size_t> nextLine{0};
-    std::vector<std::map<std::string, int>> localMaps(numThreads);
+    // Используем пакетную обработку строк для уменьшения contention
+    // Каждый поток обрабатывает пакет строк за раз вместо одной строки
+    const size_t BATCH_SIZE = 64;
+    std::atomic<size_t> nextBatch{0};
+    std::vector<std::unordered_map<std::string, int>> localMaps(numThreads);
 
     std::vector<std::thread> threads;
-    for (int t = 0; t < numThreads; t++) {
-        threads.emplace_back([&, t]() {
-            // Каждый поток берет следующую доступную строку
-            // Это обеспечивает лучшую балансировку нагрузки
-            while (true) {
-                size_t lineIndex = nextLine.fetch_add(1);
-                if (lineIndex >= lines.size()) break;
+    threads.reserve(numThreads);
 
-                std::istringstream iss(lines[lineIndex]);
-                std::string word;
-                while (iss >> word) {
-                    word = cleanWord(word);
-                    word = toLower(word);
-                    if (!word.empty()) {
-                        localMaps[t][word]++;
+    for (unsigned int t = 0; t < numThreads; t++) {
+        threads.emplace_back([&, t]() {
+            // Каждый поток берёт пакет строк для обработки
+            // Это уменьшает количество атомарных операций
+            while (true) {
+                size_t batchStart = nextBatch.fetch_add(BATCH_SIZE);
+                if (batchStart >= lines.size()) break;
+
+                size_t batchEnd = std::min(batchStart + BATCH_SIZE, lines.size());
+                for (size_t lineIndex = batchStart; lineIndex < batchEnd; ++lineIndex) {
+                    std::istringstream iss(lines[lineIndex]);
+                    std::string word;
+                    while (iss >> word) {
+                        word = cleanWord(word);
+                        word = toLower(word);
+                        if (!word.empty()) {
+                            localMaps[t][word]++;
+                        }
                     }
                 }
             }
@@ -123,42 +186,81 @@ int main(int argc, char* argv[]) {
     }
 
     // Параллельное объединение результатов
-    // Используем иерархическое слияние
-    std::map<std::string, int> wordCountMap;
+    // Используем иерархическое слияние с переиспользованием потоков
+    std::unordered_map<std::string, int> wordCountMap;
 
-    // Сначала сливаем пары карт параллельно
-    int numMaps = numThreads;
+    // Проверка на пустой результат
+    if (numThreads == 0) {
+        std::cout << "Нет данных для обработки" << std::endl;
+        return 0;
+    }
+
+    // Сливаем пары карт параллельно с использованием существующих потоков
+    size_t numMaps = numThreads;
     while (numMaps > 1) {
+        size_t pairs = numMaps / 2;
         std::vector<std::thread> mergeThreads;
-        int pairs = numMaps / 2;
+        mergeThreads.reserve(pairs);
 
-        for (int i = 0; i < pairs; i++) {
-            mergeThreads.emplace_back([&localMaps, i]() {
-                for (const auto& pair : localMaps[2*i + 1]) {
-                    localMaps[2*i][pair.first] += pair.second;
-                }
-                localMaps[2*i + 1].clear();
-            });
+        for (size_t i = 0; i < pairs; i++) {
+            size_t leftIdx = 2 * i;
+            size_t rightIdx = 2 * i + 1;
+
+            // Проверяем, что правый индекс существует
+            if (rightIdx < localMaps.size() && !localMaps[rightIdx].empty()) {
+                mergeThreads.emplace_back([&localMaps, leftIdx, rightIdx]() {
+                    // Резервируем место для слияния
+                    localMaps[leftIdx].reserve(localMaps[leftIdx].size() + localMaps[rightIdx].size());
+                    for (auto& pair : localMaps[rightIdx]) {
+                        localMaps[leftIdx][pair.first] += pair.second;
+                    }
+                    // Освобождаем память через swap с пустым контейнером
+                    std::unordered_map<std::string, int>().swap(localMaps[rightIdx]);
+                });
+            }
         }
 
         for (auto& t : mergeThreads) {
             t.join();
         }
 
-        numMaps = pairs + (numMaps % 2);
+        // Перемещаем объединённые карты в начало вектора
+        size_t writeIdx = 0;
+        for (size_t i = 0; i < numMaps; i += 2) {
+            if (writeIdx != i) {
+                localMaps[writeIdx] = std::move(localMaps[i]);
+            }
+            writeIdx++;
+        }
+        // Учитываем нечётную карту, если она есть
+        if (numMaps % 2 == 1) {
+            if (writeIdx != numMaps - 1) {
+                localMaps[writeIdx] = std::move(localMaps[numMaps - 1]);
+            }
+            writeIdx++;
+        }
+        numMaps = writeIdx;
     }
 
     // Финальная карта
-    wordCountMap = std::move(localMaps[0]);
+    if (!localMaps.empty()) {
+        wordCountMap = std::move(localMaps[0]);
+    }
     
     // Преобразуем map в вектор для сортировки
     std::vector<WordCount> wordCounts;
+    wordCounts.reserve(wordCountMap.size());
     for (const auto& pair : wordCountMap) {
         wordCounts.push_back({pair.first, pair.second});
     }
-    
+
     // Сортируем вектор по убыванию частоты
+#ifdef HAS_TBB
+    // Используем параллельную политику выполнения, если TBB доступен
+    std::sort(std::execution::par, wordCounts.begin(), wordCounts.end(), compareWordCount);
+#else
     std::sort(wordCounts.begin(), wordCounts.end(), compareWordCount);
+#endif
     
     // Выводим результаты
     std::cout << "Топ-" << topN << " самых частых слов в файле '" << filename << "':" << std::endl;

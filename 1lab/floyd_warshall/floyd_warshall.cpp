@@ -4,129 +4,211 @@
 #include <climits>
 #include <algorithm>
 #include <thread>
-#include <barrier>
 #include <functional>
+#include <exception>
+#include <stdexcept>
 
 using namespace std;
 
 FloydWarshall::FloydWarshall(const vector<vector<int>>& graph) {
-    n = graph.size();
-    dist = graph;
-    next.resize(n, vector<int>(n, -1));
+    n = static_cast<int>(graph.size());
     hasNegativeCycle = false;
 
-    for (int i = 0; i < n; i++) {
-        for (int j = 0; j < n; j++) {
-            if (graph[i][j] != INT_MAX && i != j) {
-                next[i][j] = j;
-            }
-        }
-    }
-}
+    // Инициализируем плоские массивы
+    dist.resize(n * n);
+    next.resize(n * n, -1);
 
-void FloydWarshall::run() {
-    int numThreads = thread::hardware_concurrency();
+    // Параллельная инициализация матриц
+    int numThreads = static_cast<int>(thread::hardware_concurrency());
     if (numThreads == 0) numThreads = 4;
     if (numThreads > n) numThreads = n;
 
-    // Используем барьер для синхронизации между итерациями
-    // Барьер освобождается когда все потоки достигают его
-    barrier sync_point(numThreads);
-
-    // Создаём потоки один раз, а не на каждой итерации
-    vector<thread> threads;
+    vector<thread> initThreads;
+    initThreads.reserve(numThreads);
 
     for (int t = 0; t < numThreads; t++) {
-        threads.emplace_back([&, t]() {
-            // Каждый поток знает свой диапазон строк
-            int rowsPerThread = n / numThreads;
-            int startRow = t * rowsPerThread;
-            int endRow = (t == numThreads - 1) ? n : startRow + rowsPerThread;
-
-            // Внешний цикл по k выполняется каждым потоком
-            for (int k = 0; k < n; k++) {
-                // Обрабатываем только свои строки
-                // Используем блочное распределение вместо построчного
-                // чтобы уменьшить false sharing
-                for (int i = startRow; i < endRow; i++) {
-                    // Кэшируем dist[i][k] чтобы избежать повторных обращений
-                    int dist_ik = dist[i][k];
-                    if (dist_ik != INT_MAX) {
-                        for (int j = 0; j < n; j++) {
-                            int dist_kj = dist[k][j];
-                            if (dist_kj != INT_MAX) {
-                                int new_dist = dist_ik + dist_kj;
-                                if (dist[i][j] > new_dist) {
-                                    dist[i][j] = new_dist;
-                                    next[i][j] = next[i][k];
-                                }
-                            }
-                        }
+        initThreads.emplace_back([&, t]() {
+            // Равномерное распределение строк между потоками
+            for (int i = t; i < n; i += numThreads) {
+                for (int j = 0; j < n; j++) {
+                    int idx = i * n + j;
+                    dist[idx] = graph[i][j];
+                    if (graph[i][j] != INT_MAX && i != j) {
+                        next[idx] = j;
                     }
                 }
-
-                // Все потоки ждут здесь перед переходом к следующему k
-                sync_point.arrive_and_wait();
             }
         });
     }
 
-    // Ждём завершения всех потоков
-    for (auto& t : threads) {
-        t.join();
+    for (auto& thr : initThreads) {
+        thr.join();
+    }
+}
+
+void FloydWarshall::run() {
+    int numThreads = static_cast<int>(thread::hardware_concurrency());
+    if (numThreads == 0) numThreads = 4;
+    if (numThreads > n) numThreads = n;
+
+    // Если граф слишком мал, используем один поток
+    if (n <= 2) {
+        numThreads = 1;
     }
 
-    // Проверка на отрицательные циклы
-    for (int i = 0; i < n; i++) {
-        if (dist[i][i] < 0) {
-            hasNegativeCycle = true;
-            break;
+    // Используем собственную реализацию барьера для совместимости
+    Barrier sync_point(numThreads);
+
+    // Для хранения исключений из потоков
+    vector<exception_ptr> exceptions(numThreads);
+
+    vector<thread> threads;
+    threads.reserve(numThreads);
+
+    for (int t = 0; t < numThreads; t++) {
+        threads.emplace_back([&, t]() {
+            try {
+                // Равномерное распределение строк (cyclic distribution)
+                // Уменьшает дисбаланс нагрузки
+                for (int k = 0; k < n; k++) {
+                    // Кэшируем строку k для уменьшения доступа к памяти
+                    // dist[k][j] нужен всем потокам, поэтому читаем его локально
+
+                    // Каждый поток обрабатывает свои строки
+                    for (int i = t; i < n; i += numThreads) {
+                        int dist_ik = dist[i * n + k];
+
+                        // Пропускаем если путь через k невозможен
+                        if (dist_ik == INT_MAX) continue;
+
+                        int base_i = i * n;
+                        for (int j = 0; j < n; j++) {
+                            int dist_kj = dist[k * n + j];
+
+                            // Проверка на переполнение и бесконечность
+                            if (dist_kj == INT_MAX) continue;
+
+                            int new_dist = dist_ik + dist_kj;
+
+                            // Проверка на переполнение при сложении
+                            if (dist_ik > 0 && dist_kj > 0 && new_dist < 0) continue;
+
+                            if (dist[base_i + j] > new_dist) {
+                                dist[base_i + j] = new_dist;
+                                next[base_i + j] = next[i * n + k];
+                            }
+                        }
+                    }
+
+                    // Синхронизация перед следующей итерацией k
+                    sync_point.arrive_and_wait();
+                }
+            } catch (...) {
+                exceptions[t] = current_exception();
+            }
+        });
+    }
+
+    // Ожидаем завершения всех потоков
+    for (auto& thr : threads) {
+        thr.join();
+    }
+
+    // Проверяем исключения
+    for (const auto& ex : exceptions) {
+        if (ex) {
+            rethrow_exception(ex);
         }
     }
+
+    // Параллельная проверка на отрицательные циклы
+    atomic<bool> foundNegative{false};
+    vector<thread> checkThreads;
+    checkThreads.reserve(numThreads);
+
+    for (int t = 0; t < numThreads; t++) {
+        checkThreads.emplace_back([&, t]() {
+            for (int i = t; i < n; i += numThreads) {
+                if (dist[i * n + i] < 0) {
+                    foundNegative = true;
+                    return;  // Досрочный выход при обнаружении
+                }
+                // Проверяем флаг чтобы выйти раньше если другой поток нашёл
+                if (foundNegative.load(memory_order_relaxed)) return;
+            }
+        });
+    }
+
+    for (auto& thr : checkThreads) {
+        thr.join();
+    }
+
+    hasNegativeCycle = foundNegative.load();
 }
 
 int FloydWarshall::getDistance(int from, int to) const {
     if (from < 0 || from >= n || to < 0 || to >= n) {
         return INT_MAX;
     }
-    return dist[from][to];
+    return dist[from * n + to];
 }
 
 bool FloydWarshall::hasNegativeCycles() const {
-    return hasNegativeCycle;
+    return hasNegativeCycle.load();
 }
 
 vector<int> FloydWarshall::getPath(int from, int to) const {
     vector<int> path;
 
-    if (from < 0 || from >= n || to < 0 || to >= n || dist[from][to] == INT_MAX) {
+    if (from < 0 || from >= n || to < 0 || to >= n) {
+        return path;
+    }
+
+    if (dist[from * n + to] == INT_MAX) {
         return path;
     }
 
     int current = from;
-    while (current != to) {
+    // Защита от бесконечного цикла (максимум n шагов)
+    int steps = 0;
+    while (current != to && steps < n) {
         path.push_back(current);
-        current = next[current][to];
-        if (current == -1) {
-            return vector<int>();
+        int nextNode = next[current * n + to];
+        if (nextNode == -1) {
+            return vector<int>();  // Путь не найден
         }
+        current = nextNode;
+        steps++;
     }
-    path.push_back(to);
+
+    if (current == to) {
+        path.push_back(to);
+    } else {
+        return vector<int>();  // Путь не найден (цикл?)
+    }
 
     return path;
 }
 
-const vector<vector<int>>& FloydWarshall::getDistanceMatrix() const {
-    return dist;
+vector<vector<int>> FloydWarshall::getDistanceMatrix() const {
+    // Конвертируем плоский массив обратно в 2D для совместимости
+    vector<vector<int>> result(n, vector<int>(n));
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            result[i][j] = dist[i * n + j];
+        }
+    }
+    return result;
 }
 
 void FloydWarshall::printMatrix() const {
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < n; j++) {
-            if (dist[i][j] == INT_MAX) {
+            int val = dist[i * n + j];
+            if (val == INT_MAX) {
                 cout << "INF\t";
             } else {
-                cout << dist[i][j] << "\t";
+                cout << val << "\t";
             }
         }
         cout << endl;
