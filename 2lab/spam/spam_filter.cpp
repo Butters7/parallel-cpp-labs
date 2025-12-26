@@ -4,146 +4,188 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
-#include <omp.h>  // OpenMP для параллельного программирования
+#include <omp.h>
 
 SpamFilter::SpamFilter(double smoothing) : alpha(smoothing) {}
 
-std::string SpamFilter::toLower(const std::string& str) {
+std::string SpamFilter::toLower(const std::string& str) const {
     std::string result = str;
-    std::transform(result.begin(), result.end(), result.begin(), ::tolower);
+    for (char& c : result) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
     return result;
 }
 
-std::vector<std::string> SpamFilter::tokenize(const std::string& text) {
+std::vector<std::string> SpamFilter::tokenize(const std::string& text) const {
     std::vector<std::string> tokens;
-    std::stringstream ss(text);
+    std::istringstream ss(text);
     std::string token;
-    
+
     while (ss >> token) {
-        token.erase(std::remove_if(token.begin(), token.end(), ::ispunct), token.end());
+        // Удаляем пунктуацию
+        token.erase(
+            std::remove_if(token.begin(), token.end(),
+                [](unsigned char c) { return std::ispunct(c); }),
+            token.end()
+        );
         token = toLower(token);
-        if (!token.empty() && token.length() > 2) tokens.push_back(token);
+        if (!token.empty() && token.length() > 2) {
+            tokens.push_back(token);
+        }
     }
-    
+
     return tokens;
 }
 
 void SpamFilter::train(const std::string& spamFile, const std::string& hamFile) {
+    // Читаем файлы последовательно
     std::ifstream spamStream(spamFile);
     std::ifstream hamStream(hamFile);
+
+    if (!spamStream.is_open() || !hamStream.is_open()) {
+        std::cerr << "Ошибка открытия файлов обучения" << std::endl;
+        return;
+    }
+
+    std::vector<std::string> spamLines;
+    std::vector<std::string> hamLines;
     std::string line;
 
-    // Очищаем предыдущую модель если была
-    vocabulary.clear();
-    totalSpam.store(0);
-    totalHam.store(0);
-
-    int local_spam_count = 0;
-    int local_ham_count = 0;
-
-    // Обучение на спаме
     while (std::getline(spamStream, line)) {
-        auto tokens = tokenize(line);
-        for (const auto& token : tokens) {
-            vocabulary[token].spamCount++;
-        }
-        local_spam_count++;
+        if (!line.empty()) spamLines.push_back(line);
     }
-
-    // Обучение на хаме
     while (std::getline(hamStream, line)) {
-        auto tokens = tokenize(line);
-        for (const auto& token : tokens) {
-            vocabulary[token].hamCount++;
-        }
-        local_ham_count++;
+        if (!line.empty()) hamLines.push_back(line);
     }
 
-    // Атомарное обновление счетчиков
-    totalSpam.store(local_spam_count);
-    totalHam.store(local_ham_count);
+    totalSpam = static_cast<int>(spamLines.size());
+    totalHam = static_cast<int>(hamLines.size());
 
-    // Помечаем модель как обученную
-    is_trained.store(true);
+    // Очищаем словарь
+    vocabulary.clear();
+
+    // Локальные словари для каждого потока (избегаем race condition)
+    const int maxThreads = omp_get_max_threads();
+    std::vector<std::unordered_map<std::string, WordStats>> threadVocabs(maxThreads);
+
+    // Параллельная обработка спам-сообщений
+    #pragma omp parallel for schedule(dynamic) default(none) \
+        shared(spamLines, threadVocabs)
+    for (size_t i = 0; i < spamLines.size(); ++i) {
+        int tid = omp_get_thread_num();
+        auto tokens = tokenize(spamLines[i]);
+        for (const auto& token : tokens) {
+            threadVocabs[tid][token].spamCount++;
+        }
+    }
+
+    // Параллельная обработка ham-сообщений
+    #pragma omp parallel for schedule(dynamic) default(none) \
+        shared(hamLines, threadVocabs)
+    for (size_t i = 0; i < hamLines.size(); ++i) {
+        int tid = omp_get_thread_num();
+        auto tokens = tokenize(hamLines[i]);
+        for (const auto& token : tokens) {
+            threadVocabs[tid][token].hamCount++;
+        }
+    }
+
+    // Слияние локальных словарей (последовательно, безопасно)
+    for (const auto& localVocab : threadVocabs) {
+        for (const auto& entry : localVocab) {
+            vocabulary[entry.first].spamCount += entry.second.spamCount;
+            vocabulary[entry.first].hamCount += entry.second.hamCount;
+        }
+    }
+
+    std::cout << "Обучение завершено: spam=" << totalSpam
+              << ", ham=" << totalHam
+              << ", словарь=" << vocabulary.size() << " слов" << std::endl;
 }
 
-bool SpamFilter::classify(const std::string& email) {
-    // Проверка что модель обучена
-    if (!is_trained.load()) {
-        std::cerr << "Ошибка: модель не обучена. Вызовите train() перед classify()" << std::endl;
-        return false;
-    }
-
+bool SpamFilter::classify(const std::string& email) const {
     auto tokens = tokenize(email);
 
-    // Загружаем атомарные значения один раз для консистентности
-    int spam_count = totalSpam.load();
-    int ham_count = totalHam.load();
-
-    if (spam_count == 0 && ham_count == 0) {
-        std::cerr << "Ошибка: нет обучающих данных" << std::endl;
+    if (tokens.empty() || totalSpam == 0 || totalHam == 0) {
         return false;
     }
 
-    double spamLogProb = std::log(static_cast<double>(spam_count) / (spam_count + ham_count));
-    double hamLogProb = std::log(static_cast<double>(ham_count) / (spam_count + ham_count));
-    int vocabSize = vocabulary.size();
+    const double spamPrior = std::log(static_cast<double>(totalSpam) / (totalSpam + totalHam));
+    const double hamPrior = std::log(static_cast<double>(totalHam) / (totalSpam + totalHam));
+    const int vocabSize = static_cast<int>(vocabulary.size());
+    const double smoothing = alpha;
+    const int spamTotal = totalSpam;
+    const int hamTotal = totalHam;
 
     double spamSum = 0.0;
     double hamSum = 0.0;
 
-    // #pragma omp parallel for - распараллеливает цикл обработки токенов
-    // reduction(+:spamSum, hamSum) - каждый поток накапливает свои частичные суммы,
-    // в конце все суммы объединяются (избегаем гонки данных)
-    // schedule(dynamic) - динамическое распределение итераций между потоками
-    // (поиск в vocabulary может занимать разное время)
-    // ПОТОКОБЕЗОПАСНО: vocabulary используется только для чтения (после train())
-    #pragma omp parallel for reduction(+:spamSum, hamSum) schedule(dynamic)
+    // Параллельное вычисление логарифмов вероятностей
+    // reduction - безопасное накопление сумм
+    // schedule(static) - итерации примерно равны по времени
+    #pragma omp parallel for reduction(+:spamSum, hamSum) schedule(static) \
+        default(none) shared(tokens, vocabulary, vocabSize, smoothing, spamTotal, hamTotal)
     for (size_t i = 0; i < tokens.size(); ++i) {
-        const auto& token = tokens[i];
-        auto it = vocabulary.find(token);
-        double spamProb = alpha;
-        double hamProb = alpha;
+        double spamProb = smoothing;
+        double hamProb = smoothing;
 
+        auto it = vocabulary.find(tokens[i]);
         if (it != vocabulary.end()) {
             spamProb += it->second.spamCount;
             hamProb += it->second.hamCount;
         }
 
-        // Накапливаем логарифмы вероятностей
-        spamSum += std::log(spamProb / (spam_count + alpha * vocabSize));
-        hamSum += std::log(hamProb / (ham_count + alpha * vocabSize));
+        spamSum += std::log(spamProb / (spamTotal + smoothing * vocabSize));
+        hamSum += std::log(hamProb / (hamTotal + smoothing * vocabSize));
     }
 
-    spamLogProb += spamSum;
-    hamLogProb += hamSum;
-
-    return spamLogProb > hamLogProb;
+    return (spamPrior + spamSum) > (hamPrior + hamSum);
 }
 
-void SpamFilter::saveModel(const std::string& filename) {
+void SpamFilter::saveModel(const std::string& filename) const {
     std::ofstream file(filename);
-    file << totalSpam.load() << " " << totalHam.load() << " " << alpha << std::endl;
-    for (const auto& [word, stats] : vocabulary) {
-        file << word << " " << stats.spamCount << " " << stats.hamCount << std::endl;
+    if (!file.is_open()) {
+        std::cerr << "Ошибка сохранения модели: " << filename << std::endl;
+        return;
     }
+
+    file << totalSpam << " " << totalHam << " " << alpha << "\n";
+    for (const auto& entry : vocabulary) {
+        file << entry.first << " "
+             << entry.second.spamCount << " "
+             << entry.second.hamCount << "\n";
+    }
+
+    std::cout << "Модель сохранена: " << filename << std::endl;
 }
 
 void SpamFilter::loadModel(const std::string& filename) {
     std::ifstream file(filename);
-    int spam, ham;
-    file >> spam >> ham >> alpha;
-
-    totalSpam.store(spam);
-    totalHam.store(ham);
+    if (!file.is_open()) {
+        std::cerr << "Ошибка загрузки модели: " << filename << std::endl;
+        return;
+    }
 
     vocabulary.clear();
+    file >> totalSpam >> totalHam >> alpha;
+
     std::string word;
     int spamCount, hamCount;
     while (file >> word >> spamCount >> hamCount) {
         vocabulary[word] = {spamCount, hamCount};
     }
 
-    // Помечаем модель как обученную после загрузки
-    is_trained.store(true);
+    std::cout << "Модель загружена: spam=" << totalSpam
+              << ", ham=" << totalHam
+              << ", словарь=" << vocabulary.size() << " слов" << std::endl;
+}
+
+void SpamFilter::setNumThreads(int n) {
+    if (n > 0) {
+        omp_set_num_threads(n);
+    }
+}
+
+int SpamFilter::getNumThreads() const {
+    return omp_get_max_threads();
 }

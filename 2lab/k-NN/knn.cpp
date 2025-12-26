@@ -1,81 +1,76 @@
 #include "knn.h"
 #include <cmath>
 #include <algorithm>
-#include <map>
-#include <iostream>
-#include <limits>
+#include <unordered_map>
 #include <omp.h>
+#include <stdexcept>
 
 KNN::KNN(int k) : k(k) {}
 
 void KNN::fit(const std::vector<std::vector<double>>& X, const std::vector<int>& y) {
+    if (X.size() != y.size()) {
+        throw std::invalid_argument("X and y must have the same size");
+    }
     X_train = X;
     y_train = y;
 }
 
-double KNN::euclideanDistance(const std::vector<double>& a, const std::vector<double>& b) {
-    // Проверка размеров векторов
-    if (a.size() != b.size()) {
-        std::cerr << "Ошибка: размеры векторов не совпадают ("
-                  << a.size() << " vs " << b.size() << ")" << std::endl;
-        return std::numeric_limits<double>::max();
-    }
-
-    double distance = 0.0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        distance += std::pow(a[i] - b[i], 2);
-    }
-    return std::sqrt(distance);
-}
-
 int KNN::predict(const std::vector<double>& x) {
-    size_t n = X_train.size();
-
-    // Проверка: должно быть достаточно точек для классификации
+    const size_t n = X_train.size();
     if (n == 0) {
-        std::cerr << "Ошибка: нет обучающих данных" << std::endl;
-        return -1;
+        throw std::runtime_error("Model not fitted");
     }
 
-    // Проверка: k не должно превышать количество точек
-    int k_actual = k;
-    if (k > static_cast<int>(n)) {
-        std::cerr << "Предупреждение: k=" << k << " больше количества точек n=" << n
-                  << ", используем k=" << n << std::endl;
-        k_actual = n;
+    const size_t dim = x.size();
+
+    // Проверка размерности
+    if (!X_train.empty() && X_train[0].size() != dim) {
+        throw std::invalid_argument("Input dimension mismatch");
     }
 
+    // k не может быть больше n
+    const int k_actual = std::min(k, static_cast<int>(n));
+
+    // Предвыделяем память для distances (каждый поток пишет в свой элемент)
     std::vector<std::pair<double, int>> distances(n);
 
-    // #pragma omp parallel for - распараллеливает вычисление расстояний
-    // schedule(static) - статическое распределение итераций между потоками
-    // каждый поток получает примерно равное количество итераций заранее
-    // Эффективно когда время выполнения каждой итерации примерно одинаково
-    // Здесь НЕ нужен reduction, т.к. каждый поток пишет в свой элемент distances[i]
-    #pragma omp parallel for schedule(static)
+    // Параллельное вычисление расстояний
+    // schedule(dynamic) - т.к. euclideanDistance может занимать разное время
+    // default(none) - явное указание всех переменных
+    #pragma omp parallel for schedule(dynamic) default(none) \
+        shared(distances, X_train, y_train, x, n, dim)
     for (size_t i = 0; i < n; ++i) {
-        double dist = euclideanDistance(x, X_train[i]);
-        distances[i] = std::make_pair(dist, y_train[i]);
+        const std::vector<double>& train_point = X_train[i];
+
+        // Инлайн вычисление евклидова расстояния (избегаем вызова функции)
+        double dist = 0.0;
+        for (size_t j = 0; j < dim; ++j) {
+            double diff = x[j] - train_point[j];
+            dist += diff * diff;
+        }
+        dist = std::sqrt(dist);
+
+        distances[i] = {dist, y_train[i]};
     }
 
-    // Сортируем по расстоянию (первые k_actual элементов)
-    // partial_sort сложно распараллелить эффективно, поэтому не используем pragma omp здесь
+    // Частичная сортировка - только первые k_actual элементов
     std::partial_sort(
         distances.begin(),
         distances.begin() + k_actual,
         distances.end(),
-        [](const auto& a, const auto& b) { return a.first < b.first; }
+        [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+            return a.first < b.first;
+        }
     );
 
-    // Подсчитываем частоту меток среди k_actual ближайших соседей
-    // k обычно маленькое (3-10), параллелить не имеет смысла
-    std::map<int, int> freq;
+    // Подсчёт частоты меток среди k ближайших соседей
+    std::unordered_map<int, int> freq;
     for (int i = 0; i < k_actual; ++i) {
         freq[distances[i].second]++;
     }
 
     // Находим метку с максимальной частотой
-    int predicted_label = -1;
+    int predicted_label = distances[0].second;
     int max_freq = 0;
     for (const auto& entry : freq) {
         if (entry.second > max_freq) {
@@ -85,4 +80,14 @@ int KNN::predict(const std::vector<double>& x) {
     }
 
     return predicted_label;
+}
+
+void KNN::setNumThreads(int num_threads) {
+    if (num_threads > 0) {
+        omp_set_num_threads(num_threads);
+    }
+}
+
+int KNN::getNumThreads() const {
+    return omp_get_max_threads();
 }

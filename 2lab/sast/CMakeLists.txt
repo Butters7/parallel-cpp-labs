@@ -7,5 +7,5 @@ add_executable(sast sast.cpp)
 find_package(OpenSSL REQUIRED)
 find_package(OpenMP REQUIRED)
 
-target_compile_options(sast PUBLIC "-fno-lto" "-fopenmp" "-foffload=nvptx-none" "-fstack-protector")
+target_compile_options(sast PUBLIC "-fopenmp")
 target_link_libraries(${PROJECT_NAME} OpenSSL::SSL OpenMP::OpenMP_CXX)
