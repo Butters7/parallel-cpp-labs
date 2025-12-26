@@ -1,11 +1,6 @@
 cmake_minimum_required(VERSION 3.10.0)
 project(floyd_warshall VERSION 0.1.0 LANGUAGES C CXX)
 
-# C++17 достаточно - используем собственную реализацию барьера
-# вместо std::barrier из C++20 для лучшей совместимости
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 add_executable(floyd_warshall floyd_warshall.cpp main.cpp)
 
 find_package(OpenSSL REQUIRED)
